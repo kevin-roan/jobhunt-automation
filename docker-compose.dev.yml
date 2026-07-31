@@ -1,0 +1,55 @@
+name: deedy-automation-dev
+
+# Development stack: sources are bind-mounted and both servers run with hot
+# reload. Use: docker compose -f docker-compose.dev.yml up
+
+services:
+  api:
+    build:
+      context: .
+      target: deps
+    container_name: deedy-api-dev
+    working_dir: /app
+    command: >
+      sh -c "npx playwright install chromium firefox &&
+             npm run build -w @deedy/shared &&
+             npm run dev -w @deedy/api"
+    environment:
+      NODE_ENV: development
+      DATA_DIR: /data
+      LOG_LEVEL: debug
+      PORT: 8080
+      CORS_ORIGINS: http://localhost:5173
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '0'
+    ports:
+      - '8080:8080'
+    volumes:
+      - .:/app
+      - api-node-modules:/app/node_modules
+      - dev-data:/data
+      - playwright-browsers:/ms-playwright
+    shm_size: '1gb'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  web:
+    build:
+      context: .
+      target: deps
+    container_name: deedy-web-dev
+    working_dir: /app
+    command: sh -c "npm run build -w @deedy/shared && npm run dev -w @deedy/web -- --host 0.0.0.0"
+    environment:
+      VITE_API_URL: http://localhost:8080
+    ports:
+      - '5173:5173'
+    volumes:
+      - .:/app
+      - web-node-modules:/app/node_modules
+
+volumes:
+  api-node-modules:
+  web-node-modules:
+  dev-data:
+  playwright-browsers:

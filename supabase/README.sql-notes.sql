@@ -1,0 +1,155 @@
+-- ===========================================================================
+-- deedy-automation : operator notes for the Supabase mirror
+-- ===========================================================================
+-- This file is documentation. It is intentionally a .sql file containing only
+-- comments, so it can be opened in the Supabase SQL editor next to schema.sql
+-- and running it does nothing.
+--
+-- ---------------------------------------------------------------------------
+-- 0. WHAT THIS CLOUD PROJECT IS FOR
+-- ---------------------------------------------------------------------------
+-- The job search system runs entirely on your machine. The only reason a cloud
+-- project exists is so a phone can see progress and send commands without you
+-- opening a port, running a tunnel, or exposing the host to the internet.
+--
+-- What is mirrored up: job title, company, location, source, salary range,
+-- score, recommendation, status, application status/step/attempts/error and
+-- timestamps, queue counts, notification title/body/kind/level, and the
+-- command queue the phone writes to.
+--
+-- What is NEVER mirrored up: resumes (markdown or files), cover letters,
+-- profile PII (email, phone, street address, postal code), provider cookies,
+-- session state or tokens, LLM prompts and responses, the LLM api key, run
+-- screenshots, HTML snapshots, and the local encryption key.
+--
+-- If you delete the Supabase project tomorrow you lose the phone view and
+-- nothing else. The local SQLite database remains the only source of truth.
+--
+-- ---------------------------------------------------------------------------
+-- 1. CREATE THE PROJECT
+-- ---------------------------------------------------------------------------
+-- a. Create a new project at https://supabase.com/dashboard. Pick a region near
+--    you. The free tier is sufficient.
+-- b. Authentication > Providers: keep Email enabled. Create exactly one user
+--    (Authentication > Users > Add user) - that user's uuid is the user_id
+--    stamped on every row.
+-- c. If you are the only user, turn OFF public sign-ups under
+--    Authentication > Sign In / Providers so nobody else can create an account
+--    in your project.
+--
+-- ---------------------------------------------------------------------------
+-- 2. APPLY THE SCHEMA
+-- ---------------------------------------------------------------------------
+-- Dashboard route:
+--   SQL Editor > New query > paste the entire contents of
+--   supabase/schema.sql > Run.
+--
+-- CLI route (if you have the supabase CLI and psql installed):
+--   psql "$SUPABASE_DB_URL" -f supabase/schema.sql
+--
+-- schema.sql is idempotent. Run it again after every upgrade of this project;
+-- it will add anything new and leave existing rows untouched. It never drops a
+-- table and never deletes data.
+--
+-- Verify afterwards, in the SQL editor:
+--   select tablename, rowsecurity from pg_tables where schemaname = 'public';
+--     -> all six tables must show rowsecurity = true
+--   select tablename, cmd, policyname from pg_policies where schemaname = 'public';
+--     -> SELECT on all six tables, and writes only where the phone needs them:
+--        notifications UPDATE + DELETE, commands INSERT,
+--        devices INSERT + UPDATE + DELETE. jobs, applications and queue_stats
+--        are read-only to the app; the host is their only writer.
+--   select tablename from pg_publication_tables where pubname = 'supabase_realtime';
+--     -> jobs, applications, notifications, queue_stats
+--
+-- ---------------------------------------------------------------------------
+-- 3. CONFIGURE THE LOCAL SERVER
+-- ---------------------------------------------------------------------------
+-- Project Settings > API gives you three values:
+--   Project URL         -> sync.supabaseUrl
+--   anon public key     -> used by the MOBILE APP only
+--   service_role key    -> used by the LOCAL SERVER only
+--
+-- Put the URL and the service_role key into the local settings (Settings >
+-- Sync in the dashboard, or the SYNC_SUPABASE_URL / SYNC_SUPABASE_SERVICE_KEY
+-- environment variables). They are stored encrypted in the local database with
+-- the host encryption key and are never transmitted anywhere but Supabase.
+--
+-- The service_role key BYPASSES row level security. That is deliberate: the
+-- local server is the single trusted writer and it stamps user_id itself. Two
+-- consequences:
+--   * never put the service_role key in the mobile app bundle, a git repo, a
+--     screenshot, or a shell history file you sync;
+--   * anyone holding it has full read/write on this project, so treat it like
+--     a password.
+--
+-- The mobile app only ever gets the anon key plus a normal user login, so the
+-- RLS policies in schema.sql are what actually confine it.
+--
+-- ---------------------------------------------------------------------------
+-- 4. ROTATING KEYS
+-- ---------------------------------------------------------------------------
+-- Rotate immediately if the service_role key was pasted anywhere shared, if a
+-- laptop holding it was lost, or on a routine schedule (every 90 days is a
+-- reasonable habit).
+--
+-- 4a. Rotating the service_role and anon keys (JWT secret rotation)
+--   1. Stop the local server, or pause sync from Settings > Sync. In-flight
+--      pushes will fail with 401 during the rotation window otherwise.
+--   2. Dashboard > Project Settings > API > JWT Settings > Generate new JWT
+--      secret. This invalidates the old anon AND service_role keys at once,
+--      and signs out every logged-in mobile session.
+--   3. Copy the NEW service_role key into local Settings > Sync and save.
+--   4. Copy the NEW anon key into the mobile app configuration and rebuild or
+--      re-publish the app.
+--   5. Re-enable sync. Sign in again on the phone.
+--   6. Confirm with: select count(*) from public.jobs where updated_at > now() - interval '10 minutes';
+--
+-- 4b. Rotating publishable / secret API keys (new-style keys, if your project
+--     uses them instead of the legacy anon + service_role pair)
+--   Project Settings > API Keys > create a new secret key, put it into local
+--   Settings > Sync, verify a sync round-trip succeeds, then revoke the old
+--   secret key. This form of rotation has no downtime because both keys are
+--   valid at the same time - always add the new one before revoking the old.
+--
+-- 4c. Rotating the database password
+--   Project Settings > Database > Reset database password. Only needed if you
+--   applied the schema over psql with a connection string; the local server
+--   uses the REST API and does not hold the database password.
+--
+-- 4d. Rotating the LOCAL encryption key
+--   That key lives on the host and protects credentials in the local SQLite
+--   database. It is not stored in Supabase and rotating it has no effect here.
+--   Follow the local key rotation procedure instead.
+--
+-- ---------------------------------------------------------------------------
+-- 5. UNPAIRING A PHONE
+-- ---------------------------------------------------------------------------
+-- Remove just that device's push registration:
+--   delete from public.devices where expo_push_token = '<token>';
+-- Or drop every device and force re-registration:
+--   delete from public.devices where user_id = auth.uid();
+--
+-- ---------------------------------------------------------------------------
+-- 6. WIPING THE MIRROR
+-- ---------------------------------------------------------------------------
+-- Safe at any time - the host holds the source of truth and will re-push on
+-- the next full sync (trigger it with the sync.full command or from
+-- Settings > Sync).
+--   truncate public.jobs, public.applications, public.notifications,
+--            public.queue_stats, public.commands, public.devices;
+--
+-- To leave the cloud entirely: disable sync locally first (so the outbox stops
+-- growing), then delete the Supabase project. Nothing local is lost.
+--
+-- ---------------------------------------------------------------------------
+-- 7. HOUSEKEEPING
+-- ---------------------------------------------------------------------------
+-- Completed commands and read notifications accumulate. Prune occasionally:
+--   delete from public.commands
+--    where status in ('succeeded', 'failed')
+--      and completed_at < now() - interval '7 days';
+--   delete from public.notifications
+--    where read = true
+--      and created_at < now() - interval '30 days';
+-- ===========================================================================

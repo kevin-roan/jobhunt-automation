@@ -1,0 +1,41 @@
+{
+  "name": "deedy-automation",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Autonomous, fully-local AI job search and application platform",
+  "license": "MIT",
+  "workspaces": [
+    "packages/*",
+    "apps/api",
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "npm run build -w @deedy/shared && npm run build -w @deedy/api && npm run build -w @deedy/web",
+    "dev": "concurrently -n api,web -c blue,magenta \"npm run dev -w @deedy/api\" \"npm run dev -w @deedy/web\"",
+    "start": "node apps/api/dist/index.js",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "npm run test -w @deedy/api",
+    "test:e2e": "npm run test:e2e -w @deedy/web",
+    "db:migrate": "npm run db:migrate -w @deedy/api",
+    "db:seed": "npm run db:seed -w @deedy/api",
+    "mobile:install": "npm --prefix apps/mobile install",
+    "mobile:typecheck": "npm --prefix apps/mobile run typecheck",
+    "mobile:start": "npm --prefix apps/mobile start"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "concurrently": "^9.1.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^9.1.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0"
+  }
+}
