@@ -1,5 +1,5 @@
 import * as React from 'react';
-import { useLocation } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   AlertTriangle,
@@ -11,6 +11,7 @@ import {
   Globe,
   Link2,
   ListChecks,
+  Network,
   Play,
   Plug,
   Plus,
@@ -23,6 +24,7 @@ import {
   ShieldCheck,
   Smartphone,
   User,
+  Workflow,
   X,
 } from 'lucide-react';
 import {
@@ -31,6 +33,7 @@ import {
   EXPERIENCE_LEVELS,
   LLM_PROVIDERS,
   REMOTE_TYPES,
+  VPN_BACKENDS,
   type EmploymentType,
   type ExperienceLevel,
   type RemoteType,
@@ -68,6 +71,8 @@ const SECTION_LABELS: Record<SectionKey, string> = {
   application: 'Applications',
   queue: 'Queue',
   scheduler: 'Scheduler',
+  pipeline: 'Pipeline',
+  vpn: 'VPN',
   notifications: 'Notifications',
   profile: 'Candidate profile',
   sync: 'Mobile sync',
@@ -80,6 +85,8 @@ const SECTION_ORDER: SectionKey[] = [
   'application',
   'queue',
   'scheduler',
+  'pipeline',
+  'vpn',
   'notifications',
   'profile',
   'sync',
@@ -144,6 +151,15 @@ const SCHEDULER_TASKS: { name: string; label: string; description: string }[] = 
   { name: 'backup', label: 'Backup', description: 'Snapshot the SQLite database now.' },
 ];
 
+/** Backend ids are wire values; these are what an operator would recognise. */
+const VPN_BACKEND_LABELS: Record<Settings['vpn']['backend'], string> = {
+  none: 'None',
+  protonvpn: 'Proton VPN',
+  nmcli: 'NetworkManager',
+  wg_quick: 'wg-quick',
+  command: 'Custom command',
+};
+
 const humanize = (value: string): string => value.replace(/_/g, ' ');
 
 /** Rebuilds a Settings object section by section so every branch stays exactly typed. */
@@ -155,6 +171,8 @@ function rebuildSettings(choose: <K extends SectionKey>(key: K) => Settings[K]):
     application: choose('application'),
     queue: choose('queue'),
     scheduler: choose('scheduler'),
+    pipeline: choose('pipeline'),
+    vpn: choose('vpn'),
     notifications: choose('notifications'),
     profile: choose('profile'),
     sync: choose('sync'),
@@ -200,6 +218,10 @@ function buildPatch(section: SectionKey, draft: Settings, server: Settings): Set
       return { queue: draft.queue };
     case 'scheduler':
       return { scheduler: draft.scheduler };
+    case 'pipeline':
+      return { pipeline: draft.pipeline };
+    case 'vpn':
+      return { vpn: draft.vpn };
     case 'profile':
       return { profile: draft.profile };
   }
@@ -391,6 +413,20 @@ export default function SettingsPage(): JSX.Element {
     setDraft((current) =>
       current ? { ...current, search: { ...current.search, ...values } } : current,
     );
+  const setKeywordExpansion = (
+    values: Partial<Settings['search']['keywordExpansion']>,
+  ): void =>
+    setDraft((current) =>
+      current
+        ? {
+            ...current,
+            search: {
+              ...current.search,
+              keywordExpansion: { ...current.search.keywordExpansion, ...values },
+            },
+          }
+        : current,
+    );
   const setApplication = (values: Partial<Settings['application']>): void =>
     setDraft((current) =>
       current ? { ...current, application: { ...current.application, ...values } } : current,
@@ -403,6 +439,12 @@ export default function SettingsPage(): JSX.Element {
     setDraft((current) =>
       current ? { ...current, scheduler: { ...current.scheduler, ...values } } : current,
     );
+  const setPipeline = (values: Partial<Settings['pipeline']>): void =>
+    setDraft((current) =>
+      current ? { ...current, pipeline: { ...current.pipeline, ...values } } : current,
+    );
+  const setVpn = (values: Partial<Settings['vpn']>): void =>
+    setDraft((current) => (current ? { ...current, vpn: { ...current.vpn, ...values } } : current));
   const setNotifications = (values: Partial<Settings['notifications']>): void =>
     setDraft((current) =>
       current ? { ...current, notifications: { ...current.notifications, ...values } } : current,
@@ -813,11 +855,11 @@ export default function SettingsPage(): JSX.Element {
           >
             <div className="grid gap-4 md:grid-cols-2">
               <ChipListField
-                label="Keywords"
+                label="Seed keywords"
                 values={draft.search.keywords}
                 onChange={(values) => setSearch({ keywords: values })}
                 placeholder="staff engineer"
-                help="Type and press Enter. Any match keeps the posting."
+                help="Type and press Enter. These are seeds, not the final search terms: the local model widens them into related titles, and every expansion is managed on the Keywords page."
               />
               <ChipListField
                 label="Excluded keywords"
@@ -840,6 +882,71 @@ export default function SettingsPage(): JSX.Element {
                 help="Matched case-insensitively against the company name."
               />
             </div>
+
+            <Separator className="my-5" />
+
+            <div className="mb-3">
+              <p className="text-sm font-medium">Keyword expansion</p>
+              <p className="text-xs text-muted-foreground">
+                The local model turns each seed above into related titles so the collectors do not
+                miss postings that word the same role differently.
+              </p>
+            </div>
+
+            <div className="mb-4">
+              <SwitchField
+                label="Let the local model widen your keywords"
+                checked={draft.search.keywordExpansion.enabled}
+                onChange={(value) => setKeywordExpansion({ enabled: value })}
+                help="Off means the collectors search your seed terms verbatim and nothing else."
+              />
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <NumberField
+                label="Terms per seed"
+                value={draft.search.keywordExpansion.perSeed}
+                onChange={(value) => setKeywordExpansion({ perSeed: value ?? 6 })}
+                min={1}
+                max={25}
+                help="How many related terms the model generates for each seed keyword."
+              />
+              <NumberField
+                label="Minimum confidence"
+                value={draft.search.keywordExpansion.minConfidence}
+                onChange={(value) => setKeywordExpansion({ minConfidence: value ?? 0.45 })}
+                min={0}
+                max={1}
+                step={0.05}
+                help="Terms the model scores below this are still saved, but they start disabled - you can review them and switch them on yourself."
+              />
+              <NumberField
+                label="Max active keywords"
+                value={draft.search.keywordExpansion.maxActiveKeywords}
+                onChange={(value) => setKeywordExpansion({ maxActiveKeywords: value ?? 30 })}
+                min={1}
+                max={200}
+                help="Caps how many terms any one collector run will search, however many are enabled."
+              />
+            </div>
+
+            <div className="mt-4">
+              <SwitchField
+                label="Re-expand when the seed list changes"
+                checked={draft.search.keywordExpansion.autoExpandOnSeedChange}
+                onChange={(value) => setKeywordExpansion({ autoExpandOnSeedChange: value })}
+                help="Runs an expansion automatically after you save a new seed. Leave off to expand on demand instead."
+              />
+            </div>
+
+            <p className="mt-3 text-[11px] leading-relaxed text-muted-foreground">
+              Individual keywords - seeds and expansions alike - are enabled, edited and deleted on
+              the{' '}
+              <Link to="/keywords" className="text-primary underline-offset-4 hover:underline">
+                Keywords
+              </Link>{' '}
+              page.
+            </p>
 
             <Separator className="my-5" />
 
@@ -1316,6 +1423,296 @@ export default function SettingsPage(): JSX.Element {
               )}
             </CardContent>
           </Card>
+        </TabsContent>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* Pipeline                                                            */}
+        {/* ------------------------------------------------------------------ */}
+        <TabsContent value="pipeline" className="space-y-4">
+          <SectionShell
+            icon={<Workflow />}
+            title="Pipeline"
+            description="Which stages of the background pipeline are allowed to run at all. Local inference takes every core it can get, so each stage that calls the model can be stopped on its own."
+            {...sectionProps('pipeline')}
+          >
+            {!draft.pipeline.enabled ? (
+              <div className="mb-4 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/5 p-3 text-xs text-warning">
+                <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+                <p>
+                  The pipeline is off. Nothing is claimed from the queue - no collecting, no
+                  scoring, no applying - and it stays that way across restarts until you turn it
+                  back on.
+                </p>
+              </div>
+            ) : null}
+
+            <div className="mb-4">
+              <SwitchField
+                label="Pipeline enabled"
+                tone="warning"
+                checked={draft.pipeline.enabled}
+                onChange={(value) => setPipeline({ enabled: value })}
+                help="The single control that stops all background work. Off means no stage claims anything from the queue, whatever the per-stage switches below say."
+              />
+            </div>
+
+            <Separator className="my-5" />
+
+            <div className="mb-3">
+              <p className="text-sm font-medium">Stages</p>
+              <p className="text-xs text-muted-foreground">
+                Turn off whatever you cannot afford to have running. Queued work is not lost - it
+                waits until the stage is enabled again.
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <SwitchField
+                label="Collect"
+                checked={draft.pipeline.collect}
+                onChange={(value) => setPipeline({ collect: value })}
+                help="Drives a browser over the job boards. Heavy on CPU and network, no model calls."
+              />
+              <SwitchField
+                label="Enrich"
+                checked={draft.pipeline.enrich}
+                onChange={(value) => setPipeline({ enrich: value })}
+                help="Calls the local model once per raw posting to pull structure out of it."
+              />
+              <SwitchField
+                label="Score"
+                checked={draft.pipeline.score}
+                onChange={(value) => setPipeline({ score: value })}
+                help="Calls the local model once per job to rank it against your profile. This is the stage that saturates the machine on a large backlog."
+              />
+              <SwitchField
+                label="Tailor"
+                checked={draft.pipeline.tailor}
+                onChange={(value) => setPipeline({ tailor: value })}
+                help="Calls the local model to rewrite the resume per job, then compiles it."
+              />
+              <SwitchField
+                label="Cover letter"
+                checked={draft.pipeline.coverLetter}
+                onChange={(value) => setPipeline({ coverLetter: value })}
+                help="Calls the local model to draft a letter per application."
+              />
+              <SwitchField
+                label="Apply"
+                checked={draft.pipeline.apply}
+                onChange={(value) => setPipeline({ apply: value })}
+                help="Drives a real browser session to fill and submit forms. No model calls, but it is the stage that talks to employers."
+              />
+            </div>
+
+            <p className="mt-5 rounded-md border border-border bg-secondary/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+              These switches are the persisted defaults - they are what the pipeline comes back to
+              after a restart. For live start and stop with in-flight counts per stage, use the
+              controls on the{' '}
+              <Link to="/" className="text-primary underline-offset-4 hover:underline">
+                Overview
+              </Link>{' '}
+              page.
+            </p>
+          </SectionShell>
+        </TabsContent>
+
+        {/* ------------------------------------------------------------------ */}
+        {/* VPN                                                                 */}
+        {/* ------------------------------------------------------------------ */}
+        <TabsContent value="vpn" className="space-y-4">
+          <SectionShell
+            icon={<Network />}
+            title="VPN"
+            description="Which country the collectors appear to browse from. Job boards are regional, so the exit country decides which index you actually search."
+            {...sectionProps('vpn')}
+          >
+            <div className="mb-4 flex items-start gap-2 rounded-md border border-border bg-secondary/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <p>
+                Connecting changes the routing of the <strong>whole machine</strong>, not just this
+                app. Moving the exit helps with two things: reaching a country&apos;s job index, and
+                spreading per-IP rate limiting. It does not defeat bot detection, which fingerprints
+                far more than the address - so rotating faster is not a substitute for collecting
+                slowly.
+              </p>
+            </div>
+
+            <div className="mb-4 space-y-3">
+              <SwitchField
+                label="VPN control enabled"
+                checked={draft.vpn.enabled}
+                onChange={(value) => setVpn({ enabled: value })}
+                help="Off means this app never touches your tunnel, whatever else is set here."
+              />
+            </div>
+
+            <div className="space-y-1.5">
+              <Label htmlFor="vpn-backend">Backend</Label>
+              <Select
+                id="vpn-backend"
+                value={draft.vpn.backend}
+                onChange={(event) =>
+                  setVpn({ backend: event.target.value as Settings['vpn']['backend'] })
+                }
+              >
+                {VPN_BACKENDS.map((value) => (
+                  <option key={value} value={value}>
+                    {VPN_BACKEND_LABELS[value]}
+                  </option>
+                ))}
+              </Select>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                Proton VPN drives the installed Proton packages through a bundled helper - sign in
+                once with the Proton VPN app first. The others exist so an already-managed tunnel
+                does not have to be replaced.
+              </p>
+            </div>
+
+            <Separator className="my-5" />
+
+            <div className="space-y-4">
+              <ChipListField
+                label="Exit countries"
+                values={draft.vpn.countries}
+                onChange={(values) =>
+                  setVpn({ countries: values.map((value) => value.trim().toUpperCase()) })
+                }
+                placeholder="NL"
+                help="Two-letter country codes, tried in this order when rotating. Leave empty to let the backend pick its own fastest server."
+              />
+              <ChipListField
+                label="Only for these collectors"
+                values={draft.vpn.collectors}
+                onChange={(values) => setVpn({ collectors: values })}
+                placeholder="indeed"
+                help="Empty means every collector. Naming just the ones that need it avoids tunnelling traffic that was working fine."
+              />
+            </div>
+
+            <Separator className="my-5" />
+
+            <div className="space-y-3">
+              <SwitchField
+                label="Rotate when a platform blocks the run"
+                checked={draft.vpn.rotateOnBlock}
+                onChange={(value) => setVpn({ rotateOnBlock: value })}
+                help="On a confirmed block or challenge, move to the next country and retry once. Never more than once per run."
+              />
+              <SwitchField
+                label="Connect before a collector run"
+                checked={draft.vpn.connectBeforeCollect}
+                onChange={(value) => setVpn({ connectBeforeCollect: value })}
+                help="Brings the tunnel up before collecting, rather than leaving it to you."
+              />
+              <SwitchField
+                label="Disconnect afterwards"
+                checked={draft.vpn.disconnectAfterCollect}
+                onChange={(value) => setVpn({ disconnectAfterCollect: value })}
+                help="Puts the rest of the machine back on its normal route once the run finishes."
+              />
+            </div>
+
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <NumberField
+                label="Minimum seconds between rotations"
+                value={draft.vpn.minRotationSeconds}
+                onChange={(value) => setVpn({ minRotationSeconds: value ?? 300 })}
+                min={30}
+                max={86400}
+                step={30}
+                help="A floor, so a run that keeps getting blocked cannot thrash the tunnel. The dashboard buttons bypass it; automatic rotation does not."
+              />
+              <NumberField
+                label="Connect timeout (seconds)"
+                value={draft.vpn.connectTimeoutSeconds}
+                onChange={(value) => setVpn({ connectTimeoutSeconds: value ?? 60 })}
+                min={5}
+                max={300}
+                step={5}
+                help="How long to wait for the tunnel to report connected before giving up."
+              />
+            </div>
+
+            {draft.vpn.backend === 'nmcli' ? (
+              <div className="mt-4">
+                <TextField
+                  label="NetworkManager connection prefix"
+                  value={draft.vpn.nmcliConnectionPrefix}
+                  onChange={(value) => setVpn({ nmcliConnectionPrefix: value })}
+                  placeholder="ProtonVPN-"
+                  help="The country code is appended, so this plus NL must match a connection you already have."
+                />
+              </div>
+            ) : null}
+
+            {draft.vpn.backend === 'wg_quick' ? (
+              <div className="mt-4">
+                <TextField
+                  label="wg-quick config prefix"
+                  value={draft.vpn.nmcliConnectionPrefix}
+                  onChange={(value) => setVpn({ nmcliConnectionPrefix: value })}
+                  placeholder="proton-"
+                  help="The country code is appended to name the interface. wg-quick usually needs passwordless sudo for the service user."
+                />
+              </div>
+            ) : null}
+
+            {draft.vpn.backend === 'command' ? (
+              <div className="mt-4 space-y-4">
+                <TextField
+                  label="Connect command"
+                  value={draft.vpn.connectCommand}
+                  onChange={(value) => setVpn({ connectCommand: value })}
+                  placeholder="/usr/local/bin/vpnctl connect {{country}}"
+                  help="{{country}} is substituted. Executed directly, never through a shell, so pipes, && and redirects will not work."
+                />
+                <TextField
+                  label="Disconnect command"
+                  value={draft.vpn.disconnectCommand}
+                  onChange={(value) => setVpn({ disconnectCommand: value })}
+                  placeholder="/usr/local/bin/vpnctl disconnect"
+                />
+                <TextField
+                  label="Status command"
+                  value={draft.vpn.statusCommand}
+                  onChange={(value) => setVpn({ statusCommand: value })}
+                  placeholder="/usr/local/bin/vpnctl status"
+                  help="Should print the current country, or nothing when disconnected."
+                />
+              </div>
+            ) : null}
+
+            <Separator className="my-5" />
+
+            <div className="space-y-3">
+              <SwitchField
+                label="Verify the exit IP after connecting"
+                tone="warning"
+                checked={draft.vpn.verifyExitIp}
+                onChange={(value) => setVpn({ verifyExitIp: value })}
+                help="The only setting here that makes an outbound request. Off by default, because everything else in this app stays on your machine."
+              />
+              {draft.vpn.verifyExitIp ? (
+                <TextField
+                  label="Exit IP endpoint"
+                  value={draft.vpn.exitIpEndpoint}
+                  onChange={(value) => setVpn({ exitIpEndpoint: value })}
+                  placeholder="https://api.protonvpn.ch/vpn/location"
+                  help="Contacted once per connect to read back the address you now appear from. Point it anywhere you trust."
+                />
+              ) : null}
+            </div>
+
+            <p className="mt-5 rounded-md border border-border bg-secondary/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+              Live connect, disconnect and rotate controls - with the current country and server -
+              are on the{' '}
+              <Link to="/sources" className="text-primary underline-offset-4 hover:underline">
+                Sources
+              </Link>{' '}
+              page, beside the platforms they affect.
+            </p>
+          </SectionShell>
         </TabsContent>
 
         {/* ------------------------------------------------------------------ */}

@@ -242,6 +242,33 @@ export class QueueRepository {
     return result.length;
   }
 
+  /**
+   * Returns an aborted job to `pending` WITHOUT consuming a retry attempt.
+   *
+   * Stopping a stage is a user decision, not a fault, so the attempt `claim()`
+   * charged is handed back and the job resumes exactly where it stood — the
+   * same treatment `reclaimStalled()` gives an interrupted run. Deliberately
+   * not `retry()`: that clears `attempts` and `lastError` outright, which would
+   * make a permanently failing job immortal across stop/start cycles.
+   */
+  release(id: number): void {
+    this.db
+      .update(queueJobs)
+      .set({
+        status: 'pending',
+        // MAX(x, 0) guards the floor: a row released without a matching claim
+        // must never end up with a negative attempt count.
+        attempts: sql`MAX(${queueJobs.attempts} - 1, 0)`,
+        runAt: nowIso(),
+        startedAt: null,
+        lockedBy: null,
+        lockExpiresAt: null,
+        updatedAt: nowIso(),
+      })
+      .where(eq(queueJobs.id, id))
+      .run();
+  }
+
   byId(id: number): QueueJobRow | undefined {
     return this.db.select().from(queueJobs).where(eq(queueJobs.id, id)).get();
   }

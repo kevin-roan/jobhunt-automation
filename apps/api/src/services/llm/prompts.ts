@@ -146,16 +146,35 @@ match score from 0 to 100. Never suggest claiming experience the candidate lacks
   },
 
   resume_tailoring: {
-    system: `You tailor resumes truthfully. You never fabricate experience, employers, dates, or credentials. ${JSON_RULE}`,
-    user: `Rewrite this resume in Markdown so it targets the job below.
+    system:
+      `You tailor resumes truthfully and you write LaTeX for the ` +
+      `deedy-resume-openfont document class. You never fabricate experience, ` +
+      `employers, dates, or credentials. ${JSON_RULE}`,
+    user: `Rewrite this resume as a complete LaTeX document that targets the job below.
 
-Rules:
+# Output
+"latex" must be a COMPLETE, compilable document for the deedy-resume-openfont
+class: it starts with \\documentclass{deedy-resume-openfont} and ends with
+\\end{document}. Not a fragment, not a diff, not Markdown.
+
+# Truthfulness rules
 - Keep every employer, title, and date exactly as written in the source resume.
 - Reorder and reword bullets to lead with the most relevant work.
 - Adopt the posting's vocabulary where it truthfully describes existing experience.
-- Never add a skill, tool, or achievement not present in the source resume.
-- Preserve Markdown structure with headings and bullet lists.
-- Keep it to a maximum of two pages of content.
+- Never add a skill, tool, achievement, or credential not present in the source resume.
+- List in injectedKeywords only the posting terms you were able to use truthfully.
+
+# LaTeX rules
+- Use only the macros in the macro reference below.
+- Escape the characters &, %, $, #, _ and braces as \\&, \\%, \\$, \\#, \\_, \\{, \\}.
+  An unescaped % silently swallows the rest of the line.
+- Never write \\usepackage: the class already loads everything it needs.
+- Never write \\input, \\include, \\write18, or an absolute path.
+- No \\newpage. Keep the document to one or two pages.
+- Do not emit a \\cvtheme line; the renderer writes it from the stored theme.
+
+# Macro reference
+{{macros}}
 
 # Target job
 Title: {{title}}
@@ -167,8 +186,96 @@ Company: {{company}}
 ## Keywords to prioritise when truthful
 {{keywords}}
 
-# Source resume (Markdown)
+# Source resume (LaTeX)
 {{resume}}`,
+  },
+
+  resume_latex_edit: {
+    system:
+      `You edit an existing deedy-resume-openfont LaTeX resume in response to a ` +
+      `single free-text instruction. You never fabricate experience, employers, ` +
+      `dates, or credentials. ${JSON_RULE}`,
+    user: `Apply the instruction to the resume below.
+
+# Output
+- "latex": the FULL edited document, not a diff and not an excerpt. It starts
+  with \\documentclass{deedy-resume-openfont} and ends with \\end{document}.
+- "theme": a PARTIAL patch. Return ONLY the keys the instruction actually asks
+  to change, and omit the object's other keys entirely. A content-only edit
+  ("make it one page", "target this job") must return an empty theme object, or
+  the caller would reset a palette the user chose deliberately.
+- "summary": one short line per change you made.
+
+# Legal theme keys
+- font: one of raleway, sourcesans, fira, garamond, latinmodern.
+- density: one of compact, normal, relaxed.
+- baseFontSize: number from 8 to 12.
+- accent, primary, headings, subheadings, rule, date: exactly six hex digits
+  with NO leading '#', e.g. 2b6cb0.
+- hmargin, vmargin: numbers from 0.6 to 3.5, in centimetres.
+Any key not in this list is invalid. Do not invent keys and do not write a
+\\cvtheme line into the document; the renderer writes it from the theme.
+
+# Truthfulness rules
+- Keep every employer, title, and date exactly as written in the current resume.
+- Never add a skill, tool, achievement, or credential that is not already there.
+- To shorten, cut or tighten existing content; never replace it with invention.
+
+# LaTeX rules
+- Use only the macros in the macro reference below.
+- Escape the characters &, %, $, #, _ and braces as \\&, \\%, \\$, \\#, \\_, \\{, \\}.
+- Never write \\usepackage, \\input, \\include, \\write18, or an absolute path.
+- No \\newpage. Keep the document to one or two pages.
+
+# Macro reference
+{{macros}}
+
+# Instruction
+{{instruction}}
+
+# Target job, if the instruction refers to one
+{{job}}
+
+# Current theme
+{{theme}}
+
+# Current resume (LaTeX)
+{{latex}}`,
+  },
+
+  keyword_expansion: {
+    system:
+      `You expand a candidate's search seeds into the terms recruiters and job ` +
+      `boards actually use. ${JSON_RULE}`,
+    user: `Expand each seed below into further search terms.
+
+Every term you return is typed verbatim into a job-board search box (LinkedIn,
+Indeed, Greenhouse). Judge each one by whether that search returns real postings.
+
+Rules:
+- 1 to 4 words per term. No boolean operators (AND, OR, NOT), no quotes, no
+  wildcards, no parentheses: those boxes do not support them.
+- Use real job-market vocabulary — the words a posting itself would use,
+  including the abbreviations recruiters type (SRE, BA, PM, QA).
+- Never invent a title. If no posting would carry the phrase, leave it out.
+- Set "seed" to exactly one of the supplied seeds, copied character for character.
+- Do not return any term already listed under Existing terms.
+- Cover the distinct kinds: alternate_title (the same job under another name),
+  adjacent_role (a genuinely neighbouring job), technology (the core tools and
+  stack), seniority (the level variants), domain (the industry or problem space).
+- Calibrate "confidence": use 0.9 or above only when a posting for the seed role
+  would very likely carry that exact term; use 0.5 or below for a plausible but
+  uncommon phrasing.
+- Return at most {{perSeed}} terms per seed.
+
+# Seeds
+{{seeds}}
+
+# Candidate profile
+{{profile}}
+
+# Existing terms — never repeat these
+{{existing}}`,
   },
 
   cover_letter: {

@@ -24,7 +24,7 @@ import {
   TriangleAlert,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { useLiveEvents } from '@/lib/events';
+import { useLiveEventLog } from '@/lib/events';
 import { formatDay, formatNumber, relativeTime, truncate } from '@/lib/utils';
 import {
   CHART_AXIS,
@@ -37,15 +37,30 @@ import {
   StatCard,
   StatusBadge,
 } from '@/components/common';
-import { Button, Card, CardContent, CardHeader, CardTitle, EmptyState } from '@/components/ui/primitives';
+import { PipelineControls } from '@/components/PipelineControls';
+import { SourceBadge, SourceIcon, sourceAccent, sourceLabel } from '@/components/sources';
+import {
+  Badge,
+  Button,
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+} from '@/components/ui/primitives';
 import { useToast } from '@/components/ui/toast';
 
 export default function OverviewPage(): JSX.Element {
   const toast = useToast();
   const queryClient = useQueryClient();
-  const events = useLiveEvents(20);
+  // Reads the root subscription's buffer; opening a second EventSource here would
+  // double every invalidation and burn one of the ~6 connections per origin.
+  const events = useLiveEventLog(20);
 
-  const analytics = useQuery({ queryKey: ['analytics', 30], queryFn: () => api.analytics.full(30) });
+  const analytics = useQuery({
+    queryKey: ['analytics', 30],
+    queryFn: () => api.analytics.full(30),
+  });
   const recentJobs = useQuery({
     queryKey: ['jobs', 'recent'],
     queryFn: () => api.jobs.list({ page: 1, pageSize: 8, sort: 'collectedAt', order: 'desc' }),
@@ -55,6 +70,7 @@ export default function OverviewPage(): JSX.Element {
     queryFn: () => api.applications.list({ page: 1, pageSize: 8 }),
   });
   const collectors = useQuery({ queryKey: ['collectors'], queryFn: api.collectors.list });
+  const sources = useQuery({ queryKey: ['sources'], queryFn: api.sources.list });
 
   const runCollectors = useMutation({
     mutationFn: async () => {
@@ -89,6 +105,8 @@ export default function OverviewPage(): JSX.Element {
           </Button>
         }
       />
+
+      <PipelineControls />
 
       {analytics.isError ? <ErrorState error={analytics.error} /> : null}
 
@@ -166,7 +184,13 @@ export default function OverviewPage(): JSX.Element {
                   tickLine={false}
                   axisLine={false}
                 />
-                <YAxis stroke={CHART_AXIS} fontSize={11} tickLine={false} axisLine={false} width={32} />
+                <YAxis
+                  stroke={CHART_AXIS}
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={false}
+                  width={32}
+                />
                 <Tooltip content={<ChartTooltipContent />} />
                 <Area
                   type="monotone"
@@ -197,7 +221,13 @@ export default function OverviewPage(): JSX.Element {
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={analytics.data?.funnel ?? []} layout="vertical" margin={{ left: 12 }}>
                 <CartesianGrid stroke={CHART_GRID} strokeDasharray="3 3" horizontal={false} />
-                <XAxis type="number" stroke={CHART_AXIS} fontSize={11} tickLine={false} axisLine={false} />
+                <XAxis
+                  type="number"
+                  stroke={CHART_AXIS}
+                  fontSize={11}
+                  tickLine={false}
+                  axisLine={false}
+                />
                 <YAxis
                   type="category"
                   dataKey="label"
@@ -207,7 +237,10 @@ export default function OverviewPage(): JSX.Element {
                   tickLine={false}
                   axisLine={false}
                 />
-                <Tooltip content={<ChartTooltipContent />} cursor={{ fill: 'hsl(var(--secondary))' }} />
+                <Tooltip
+                  content={<ChartTooltipContent />}
+                  cursor={{ fill: 'hsl(var(--secondary))' }}
+                />
                 <Bar dataKey="count" name="Count" radius={[0, 4, 4, 0]}>
                   {(analytics.data?.funnel ?? []).map((_, index) => (
                     <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />
@@ -243,9 +276,12 @@ export default function OverviewPage(): JSX.Element {
                   <ScoreBadge score={job.score} />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium">{job.title}</p>
-                    <p className="truncate text-xs text-muted-foreground">
-                      {job.company} · {job.location ?? 'Location unspecified'} · {job.source}
-                    </p>
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      <p className="truncate text-xs text-muted-foreground">
+                        {job.company} · {job.location ?? 'Location unspecified'}
+                      </p>
+                      <SourceBadge source={job.source} className="shrink-0" />
+                    </div>
                   </div>
                   <span className="hidden shrink-0 text-xs text-muted-foreground sm:block">
                     {relativeTime(job.collectedAt)}
@@ -257,35 +293,98 @@ export default function OverviewPage(): JSX.Element {
           </CardContent>
         </Card>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>Jobs by source</CardTitle>
-          </CardHeader>
-          <CardContent className="h-56">
-            {(analytics.data?.sourceDistribution.length ?? 0) === 0 ? (
-              <p className="pt-12 text-center text-xs text-muted-foreground">No data yet</p>
-            ) : (
-              <ResponsiveContainer width="100%" height="100%">
-                <PieChart>
-                  <Pie
-                    data={analytics.data?.sourceDistribution ?? []}
-                    dataKey="count"
-                    nameKey="label"
-                    innerRadius={46}
-                    outerRadius={76}
-                    paddingAngle={2}
-                    stroke="hsl(var(--card))"
-                  >
-                    {(analytics.data?.sourceDistribution ?? []).map((_, index) => (
-                      <Cell key={index} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+        <div className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Jobs by source</CardTitle>
+            </CardHeader>
+            <CardContent>
+              {(analytics.data?.sourceDistribution.length ?? 0) === 0 ? (
+                <p className="py-16 text-center text-xs text-muted-foreground">No data yet</p>
+              ) : (
+                <>
+                  <div className="h-44">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart>
+                        <Pie
+                          data={analytics.data?.sourceDistribution ?? []}
+                          dataKey="count"
+                          nameKey="label"
+                          innerRadius={40}
+                          outerRadius={68}
+                          paddingAngle={2}
+                          stroke="hsl(var(--card))"
+                        >
+                          {(analytics.data?.sourceDistribution ?? []).map((entry) => (
+                            <Cell key={entry.label} fill={sourceChartColor(entry.label)} />
+                          ))}
+                        </Pie>
+                        <Tooltip content={<ChartTooltipContent />} />
+                      </PieChart>
+                    </ResponsiveContainer>
+                  </div>
+                  <ul className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                    {(analytics.data?.sourceDistribution ?? []).map((entry) => (
+                      <li key={entry.label} className="flex items-center gap-1.5">
+                        <SourceBadge source={entry.label} />
+                        <span className="tabular text-xs text-muted-foreground">
+                          {formatNumber(entry.count)}
+                        </span>
+                      </li>
                     ))}
-                  </Pie>
-                  <Tooltip content={<ChartTooltipContent />} />
-                </PieChart>
-              </ResponsiveContainer>
-            )}
-          </CardContent>
-        </Card>
+                  </ul>
+                </>
+              )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="flex-row items-center justify-between space-y-0">
+              <CardTitle>Sources</CardTitle>
+              <Button variant="link" size="sm" asChild>
+                <Link to="/sources">View all</Link>
+              </Button>
+            </CardHeader>
+            <CardContent className="space-y-1">
+              {sources.data?.sources.length === 0 ? (
+                <EmptyState
+                  title="No sources configured"
+                  description="Enable a job board in Settings to start collecting."
+                />
+              ) : (
+                sources.data?.sources.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex items-center gap-2.5 rounded-md px-2 py-1.5 text-sm"
+                  >
+                    <SourceIcon source={entry.source} className={sourceAccent(entry.source).text} />
+                    <span className="min-w-0 flex-1 truncate font-medium">
+                      {entry.name || sourceLabel(entry.source)}
+                    </span>
+                    {/* Never colour alone: the state is spelled out for screen readers
+                        and the reason rides along as the accessible name. */}
+                    {entry.blockedReason ? (
+                      <Badge
+                        variant="destructive"
+                        className="shrink-0"
+                        // `role="img"` because Badge renders a plain <span>, on which an
+                        // aria-label is not reliably exposed without a role.
+                        role="img"
+                        title={entry.blockedReason}
+                        aria-label={`Blocked: ${entry.blockedReason}`}
+                      >
+                        blocked
+                      </Badge>
+                    ) : null}
+                    <span className="tabular shrink-0 text-xs text-muted-foreground">
+                      {formatNumber(entry.jobsToday)} today
+                    </span>
+                  </div>
+                ))
+              )}
+            </CardContent>
+          </Card>
+        </div>
       </div>
 
       <div className="grid gap-4 xl:grid-cols-2">
@@ -356,9 +455,22 @@ export default function OverviewPage(): JSX.Element {
   );
 }
 
+/**
+ * The accent carries its own resolved hex for exactly this, so pie slice and badge
+ * are driven by one palette and every accent — including `slate` — has a real colour.
+ */
+function sourceChartColor(source: string): string {
+  return sourceAccent(source).chart;
+}
+
 /** Aligns the jobs-per-day and applications-per-day series on a shared date axis. */
 function mergeSeries(
-  analytics: { jobsPerDay: { date: string; value: number }[]; applicationsPerDay: { date: string; value: number }[] } | undefined,
+  analytics:
+    | {
+        jobsPerDay: { date: string; value: number }[];
+        applicationsPerDay: { date: string; value: number }[];
+      }
+    | undefined,
 ): { date: string; jobs: number; applications: number }[] {
   if (!analytics) return [];
   const byDate = new Map<string, { date: string; jobs: number; applications: number }>();

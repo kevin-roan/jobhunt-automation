@@ -6,17 +6,70 @@ export interface SearchFilters {
   locations: string[];
   excludedCompanies: string[];
   postedWithinDays: number;
+  /**
+   * Whether `matchesSearchFilters` applies the keyword test at all. Collectors
+   * that queried the platform by term already have relevance-ranked results, so
+   * re-testing locally would discard legitimate adjacent matches.
+   *
+   * Optional, and absent means "apply it": a filter object built by hand must
+   * keep filtering, or omitting the flag would silently disable the keyword
+   * test rather than fail loudly.
+   */
+  matchKeywords?: boolean;
 }
 
-/** Pulls the subset of settings that every collector filters on. */
-export function searchFilters(settings: Settings): SearchFilters {
+/**
+ * Pulls the subset of settings that every collector filters on. `keywords` is
+ * the caller-resolved term list (from the keyword table) and is authoritative
+ * whenever it is supplied — including when it is empty, which legitimately
+ * means "the user disabled every term". Only an *omitted* argument falls back
+ * to settings.search.keywords, which keeps hand-built callers working without
+ * letting a resolved-but-empty list silently widen to the settings seed list.
+ */
+export function searchFilters(
+  settings: Settings,
+  keywords?: string[],
+  options: { matchKeywords?: boolean } = {},
+): SearchFilters {
   return {
-    keywords: settings.search.keywords,
+    keywords: keywords ?? settings.search.keywords,
     excludedKeywords: settings.search.excludedKeywords,
     locations: settings.search.locations,
     excludedCompanies: settings.search.excludedCompanies,
     postedWithinDays: settings.search.postedWithinDays,
+    matchKeywords: options.matchKeywords ?? true,
   };
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * True when the posting matches at least one search term. Collectors that
+ * already searched a platform for a term should NOT re-apply this — the
+ * platform's own relevance ranking legitimately returns adjacent matches
+ * that a substring test would throw away.
+ */
+export function matchesAnyKeyword(haystack: string, keywords: string[]): boolean {
+  if (keywords.length === 0) return true;
+  const text = haystack.toLowerCase();
+  return keywords.some((keyword) => {
+    const term = keyword.trim().toLowerCase();
+    if (term === '') return false;
+    // Multi-word terms are phrases: a plain substring test keeps them tolerant of
+    // surrounding punctuation, while single words must not match inside a longer
+    // word ("react" should not hit "reactive").
+    if (/\s/.test(term)) return text.includes(term);
+    // Boundaries only guard the ends that are themselves word characters.
+    // ".net" starts with punctuation, so a leading boundary would reject
+    // "ASP.NET Core Developer" — the form most real postings use — because the
+    // "." sits right after "p". Likewise "c++" ends in punctuation, so only its
+    // leading boundary is meaningful.
+    const lead = /[\p{L}\p{N}]/u.test(term[0] ?? '') ? '(?<![\\p{L}\\p{N}])' : '';
+    const tail = /[\p{L}\p{N}]/u.test(term[term.length - 1] ?? '') ? '(?![\\p{L}\\p{N}])' : '';
+    return new RegExp(`${lead}${escapeRegExp(term)}${tail}`, 'u').test(text);
+  });
 }
 
 /** Decodes the HTML entities providers commonly double-encode in descriptions. */
@@ -150,7 +203,16 @@ export function matchesSearchFilters(
 ): boolean {
   const haystack = `${job.title} ${job.location ?? ''} ${job.description ?? ''}`.toLowerCase();
 
-  if (filters.excludedKeywords.some((word) => haystack.includes(word.toLowerCase()))) return false;
+  // Exclusions get the same boundary treatment as inclusions: a plain substring
+  // test made "go" drop every posting mentioning "algorithm", and "c" drop
+  // everything. `matchesAnyKeyword` answers true for an empty list, so the
+  // length check keeps "no exclusions" from excluding everything.
+  if (
+    filters.excludedKeywords.length > 0 &&
+    matchesAnyKeyword(haystack, filters.excludedKeywords)
+  ) {
+    return false;
+  }
   if (
     filters.excludedCompanies.some(
       (company) => job.company.toLowerCase() === company.toLowerCase(),
@@ -158,9 +220,8 @@ export function matchesSearchFilters(
   ) {
     return false;
   }
-  if (filters.keywords.length > 0) {
-    const titleAndBody = haystack;
-    if (!filters.keywords.some((word) => titleAndBody.includes(word.toLowerCase()))) return false;
+  if (filters.matchKeywords !== false && !matchesAnyKeyword(haystack, filters.keywords)) {
+    return false;
   }
   if (filters.locations.length > 0) {
     const location = (job.location ?? '').toLowerCase();

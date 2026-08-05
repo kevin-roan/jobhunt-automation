@@ -12,12 +12,17 @@ import {
   employmentTypeSchema,
   experienceLevelSchema,
   jobStatusSchema,
+  keywordOriginSchema,
   llmTaskSchema,
   logLevelSchema,
+  pipelineStageSchema,
+  vpnBackendSchema,
   queueStatusSchema,
   queueTaskSchema,
   recommendationSchema,
   remoteTypeSchema,
+  resumeDensitySchema,
+  resumeFontSchema,
   stepStatusSchema,
 } from './enums.js';
 
@@ -98,12 +103,56 @@ export const jobScoreDtoSchema = z.object({
 });
 export type JobScoreDto = z.infer<typeof jobScoreDtoSchema>;
 
+/**
+ * A colour as six hex digits. The class writes them straight into
+ * `\definecolor{...}{HTML}{...}`, which rejects a leading `#`, so one is
+ * stripped here rather than in every caller.
+ */
+const hexColorSchema = z
+  .string()
+  .trim()
+  .transform((value) => value.replace(/^#/, '').toUpperCase())
+  .pipe(z.string().regex(/^[0-9A-F]{6}$/, 'Expected a six-digit hex colour'));
+
+/**
+ * The knobs the editor and the model are allowed to turn. Everything here is
+ * expanded into the class's `\cvtheme{...}` key list at render time, so a theme
+ * can never inject arbitrary LaTeX.
+ */
+export const resumeThemeSchema = z.object({
+  font: resumeFontSchema.default('raleway'),
+  density: resumeDensitySchema.default('normal'),
+  /** Body point size; every other size in the document scales from it. */
+  baseFontSize: z.number().min(8).max(12).default(10),
+  accent: hexColorSchema.default('2B4C7E'),
+  primary: hexColorSchema.default('1F1F1F'),
+  headings: hexColorSchema.default('3D3D3D'),
+  subheadings: hexColorSchema.default('222222'),
+  rule: hexColorSchema.default('BDBDBD'),
+  date: hexColorSchema.default('5A5A5A'),
+  /** Page margins in centimetres. */
+  hmargin: z.number().min(0.6).max(3.5).default(1.45),
+  vmargin: z.number().min(0.6).max(3.5).default(1.0),
+});
+export type ResumeTheme = z.infer<typeof resumeThemeSchema>;
+
+export const DEFAULT_RESUME_THEME: ResumeTheme = resumeThemeSchema.parse({});
+
 export const resumeDtoSchema = z.object({
   id: z.number().int(),
   name: z.string(),
   version: z.number().int(),
   targetRole: z.string().nullable(),
+  /** The source of truth: a full LaTeX document for deedy-resume-openfont. */
+  latex: z.string(),
+  theme: resumeThemeSchema,
+  templateId: z.string(),
+  /** Plain-text mirror of the LaTeX, derived at render time for the model. */
   markdown: z.string(),
+  /** Engine output from the last compile; shown verbatim when one fails. */
+  compileLog: z.string().nullable(),
+  compileOk: z.boolean(),
+  texPath: z.string().nullable(),
   filePath: z.string().nullable(),
   pdfPath: z.string().nullable(),
   docxPath: z.string().nullable(),
@@ -122,7 +171,8 @@ export type ResumeDto = z.infer<typeof resumeDtoSchema>;
 export const createResumeSchema = z.object({
   name: z.string().min(1).max(200),
   targetRole: z.string().max(200).optional(),
-  markdown: z.string().min(1),
+  latex: z.string().min(1).max(400_000),
+  theme: resumeThemeSchema.optional(),
   isBase: z.boolean().default(true),
   isDefault: z.boolean().default(false),
 });
@@ -130,6 +180,63 @@ export type CreateResumeInput = z.infer<typeof createResumeSchema>;
 
 export const updateResumeSchema = createResumeSchema.partial();
 export type UpdateResumeInput = z.infer<typeof updateResumeSchema>;
+
+/** Compile-only request: used by the editor's live preview, saves nothing. */
+export const compileResumeSchema = z.object({
+  latex: z.string().min(1).max(400_000),
+  theme: resumeThemeSchema.optional(),
+});
+export type CompileResumeInput = z.infer<typeof compileResumeSchema>;
+
+/** "Make it one page", "use a warmer palette", "target this job" — free text. */
+export const assistResumeSchema = z.object({
+  latex: z.string().min(1).max(400_000),
+  theme: resumeThemeSchema.optional(),
+  instruction: z.string().min(1).max(4000),
+  /** Optional job to tailor against; its description is added to the prompt. */
+  jobId: z.number().int().positive().nullable().optional(),
+});
+export type AssistResumeInput = z.infer<typeof assistResumeSchema>;
+
+export const assistResumeResultSchema = z.object({
+  latex: z.string(),
+  theme: resumeThemeSchema,
+  summary: z.array(z.string()),
+  model: z.string(),
+  /** Whether the returned document compiled; the log explains it when not. */
+  compileOk: z.boolean(),
+  compileLog: z.string().nullable(),
+});
+export type AssistResumeResult = z.infer<typeof assistResumeResultSchema>;
+
+/**
+ * Result of a compile-only run. The PDF is not returned inline — it is written
+ * to a short-lived preview file and fetched by id, so the editor can point an
+ * `<iframe>` straight at it instead of shuttling megabytes of base64.
+ */
+export const compileResumeResultSchema = z.object({
+  ok: z.boolean(),
+  /** Engine output, trimmed to the part that explains a failure. */
+  log: z.string(),
+  /** Fetch at `/api/resumes/preview/{previewId}`; null when the compile failed. */
+  previewId: z.string().nullable(),
+  pages: z.number().int().nullable(),
+  engine: z.string().nullable(),
+  durationMs: z.number().int(),
+});
+export type CompileResumeResult = z.infer<typeof compileResumeResultSchema>;
+
+/** Everything the editor needs to render a blank-slate resume. */
+export const resumeTemplateSchema = z.object({
+  templateId: z.string(),
+  latex: z.string(),
+  theme: resumeThemeSchema,
+  /** The macro cheatsheet, also injected into every resume prompt. */
+  macros: z.string(),
+  /** Which engine the host will use, or null when none is installed. */
+  engine: z.string().nullable(),
+});
+export type ResumeTemplate = z.infer<typeof resumeTemplateSchema>;
 
 export const coverLetterDtoSchema = z.object({
   id: z.number().int(),
@@ -284,6 +391,216 @@ export const collectorRunDtoSchema = z.object({
   finishedAt: z.string().nullable(),
 });
 export type CollectorRunDto = z.infer<typeof collectorRunDtoSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Search keywords                                                            */
+/* -------------------------------------------------------------------------- */
+
+export const searchKeywordDtoSchema = z.object({
+  id: z.number().int(),
+  keyword: z.string(),
+  /** The user term this was expanded from; null for a user term itself. */
+  seed: z.string().nullable(),
+  origin: keywordOriginSchema,
+  kind: z.string(),
+  confidence: z.number().nullable(),
+  /** Only terms that are enabled are ever typed into a search box. */
+  enabled: z.boolean(),
+  /**
+   * Collector ids this term is restricted to. Empty means every collector —
+   * useful because "React" is a fine LinkedIn query but a poor Greenhouse one.
+   */
+  sources: z.array(z.string()),
+  lastUsedAt: z.string().nullable(),
+  jobsFound: z.number().int(),
+  createdAt: z.string(),
+});
+export type SearchKeywordDto = z.infer<typeof searchKeywordDtoSchema>;
+
+export const createKeywordsSchema = z.object({
+  /** Free text: newline, comma or semicolon separated. Split server-side. */
+  keywords: z.string().min(1).max(8000),
+  origin: keywordOriginSchema.default('user'),
+  sources: z.array(z.string()).default([]),
+});
+export type CreateKeywordsInput = z.infer<typeof createKeywordsSchema>;
+
+export const updateKeywordSchema = z.object({
+  enabled: z.boolean().optional(),
+  sources: z.array(z.string()).optional(),
+  keyword: z.string().min(1).max(80).optional(),
+});
+export type UpdateKeywordInput = z.infer<typeof updateKeywordSchema>;
+
+/** Ask the local model to widen the seed terms. Seeds default to every user term. */
+export const expandKeywordsSchema = z.object({
+  seeds: z.array(z.string().min(1).max(80)).default([]),
+  perSeed: z.number().int().min(1).max(25).optional(),
+  /** Drop previously generated terms first, rather than merging into them. */
+  replaceGenerated: z.boolean().default(false),
+});
+export type ExpandKeywordsInput = z.infer<typeof expandKeywordsSchema>;
+
+export const expandKeywordsResultSchema = z.object({
+  created: z.number().int(),
+  skipped: z.number().int(),
+  removed: z.number().int(),
+  model: z.string(),
+  keywords: z.array(searchKeywordDtoSchema),
+});
+export type ExpandKeywordsResult = z.infer<typeof expandKeywordsResultSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Pipeline control                                                           */
+/* -------------------------------------------------------------------------- */
+
+export const pipelineStageStatusSchema = z.object({
+  stage: pipelineStageSchema,
+  /** Whether this stage is allowed to claim and start new work. */
+  running: z.boolean(),
+  /** True when this stage spends inference, so the UI can group the costly ones. */
+  usesLlm: z.boolean(),
+  /** Work already claimed and executing right now. */
+  inFlight: z.number().int(),
+  pending: z.number().int(),
+  failed: z.number().int(),
+});
+export type PipelineStageStatus = z.infer<typeof pipelineStageStatusSchema>;
+
+export const pipelineStatusSchema = z.object({
+  /** Master switch: false means nothing is claimed from the queue at all. */
+  enabled: z.boolean(),
+  queuePaused: z.boolean(),
+  schedulerEnabled: z.boolean(),
+  workerRunning: z.boolean(),
+  inFlight: z.number().int(),
+  stages: z.array(pipelineStageStatusSchema),
+  llm: z.object({
+    /** Inference calls executing right now across every stage. */
+    activeCalls: z.number().int(),
+    model: z.string(),
+    /** Stages that spend inference and are currently allowed to run. */
+    activeStages: z.array(pipelineStageSchema),
+  }),
+});
+export type PipelineStatus = z.infer<typeof pipelineStatusSchema>;
+
+export const pipelineControlSchema = z.object({
+  /** Omit to target the whole pipeline; otherwise just this stage. */
+  stage: pipelineStageSchema.optional(),
+  action: z.enum(['start', 'stop']),
+  /**
+   * Abort work already in flight rather than letting it drain. Aborted queue
+   * jobs are returned to pending, so nothing is lost — it just stops now.
+   */
+  abortInFlight: z.boolean().default(true),
+});
+export type PipelineControlInput = z.infer<typeof pipelineControlSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Per-source dashboard                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Everything the dashboard needs to show one platform as its own tile:
+ * whether it is configured, whether its session is alive, when it last ran and
+ * what it actually produced. LinkedIn failing silently on an expired cookie is
+ * the failure this view exists to make impossible to miss.
+ */
+export const sourceStatusDtoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  source: z.string(),
+  description: z.string(),
+  builtIn: z.boolean(),
+  enabled: z.boolean(),
+  requiresAuth: z.boolean(),
+  requiresBoards: z.boolean(),
+  /** Configured board slugs, for the sources that need them. */
+  boards: z.array(z.string()),
+  /** Null when this source needs no session. */
+  credential: z
+    .object({
+      status: credentialStatusSchema,
+      cookieCount: z.number().int().nullable(),
+      expiresAt: z.string().nullable(),
+      lastCheckedAt: z.string().nullable(),
+    })
+    .nullable(),
+  /** Whether a persistent browser profile is currently open for it. */
+  browserOpen: z.boolean(),
+  /** True while a collect run for this source is claimed by the worker. */
+  running: z.boolean(),
+  lastRun: z
+    .object({
+      status: z.string(),
+      found: z.number().int(),
+      inserted: z.number().int(),
+      duplicates: z.number().int(),
+      errors: z.number().int(),
+      message: z.string().nullable(),
+      startedAt: z.string(),
+      finishedAt: z.string().nullable(),
+    })
+    .nullable(),
+  totalJobs: z.number().int(),
+  jobsToday: z.number().int(),
+  scoredJobs: z.number().int(),
+  averageScore: z.number().nullable(),
+  applications: z.number().int(),
+  /** How many active search terms this source will actually run. */
+  activeKeywords: z.number().int(),
+  /** Set when the source cannot run as configured, with the fix. */
+  blockedReason: z.string().nullable(),
+});
+export type SourceStatusDto = z.infer<typeof sourceStatusDtoSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* VPN exit location                                                          */
+/* -------------------------------------------------------------------------- */
+
+export const vpnCountryDtoSchema = z.object({
+  /** ISO 3166-1 alpha-2. */
+  code: z.string(),
+  name: z.string(),
+  /** How many servers the backend knows about there; 0 for a hand-configured backend. */
+  servers: z.number().int(),
+});
+export type VpnCountryDto = z.infer<typeof vpnCountryDtoSchema>;
+
+export const vpnStatusDtoSchema = z.object({
+  enabled: z.boolean(),
+  backend: vpnBackendSchema,
+  /** False when the backend's tooling is missing or not signed in on this host. */
+  available: z.boolean(),
+  /** Why it is unavailable, with the command that fixes it. */
+  unavailableReason: z.string().nullable(),
+  connected: z.boolean(),
+  /** Current exit country, when the backend reports one. */
+  country: z.string().nullable(),
+  serverName: z.string().nullable(),
+  /** Only populated when `verifyExitIp` is on; otherwise null. */
+  exitIp: z.string().nullable(),
+  lastRotatedAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+  /** The rotation list from settings, in order. */
+  rotation: z.array(z.string()),
+  /** Everything the backend could connect to, for the country picker. */
+  countries: z.array(vpnCountryDtoSchema),
+});
+export type VpnStatusDto = z.infer<typeof vpnStatusDtoSchema>;
+
+export const vpnControlSchema = z.object({
+  action: z.enum(['connect', 'disconnect', 'rotate']),
+  /** Explicit exit country for `connect`; ignored by the others. */
+  country: z.string().length(2).optional(),
+  /**
+   * Bypass `minRotationSeconds`. The dashboard button sets this — a human
+   * pressing rotate is not the runaway case the floor exists to prevent.
+   */
+  force: z.boolean().default(false),
+});
+export type VpnControlInput = z.infer<typeof vpnControlSchema>;
 
 export interface CountByLabel {
   label: string;

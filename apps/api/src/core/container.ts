@@ -7,6 +7,7 @@ import { EventBus } from './events.js';
 
 import { SettingsRepository } from '../repositories/settings.repository.js';
 import { JobRepository } from '../repositories/job.repository.js';
+import { KeywordRepository } from '../repositories/keyword.repository.js';
 import {
   AnswerBankRepository,
   ApplicationRepository,
@@ -30,8 +31,13 @@ import { SyncRepository } from '../repositories/sync.repository.js';
 
 import { SettingsService } from '../services/settings.service.js';
 import { LlmService } from '../services/llm/llm.service.js';
+import { LatexService } from '../services/latex/latex.service.js';
 import { DocumentService } from '../services/document.service.js';
 import { JobService } from '../services/job.service.js';
+import { KeywordService } from '../services/keyword.service.js';
+import { PipelineService } from '../services/pipeline.service.js';
+import { SourceService } from '../services/source.service.js';
+import { VpnService } from '../services/vpn/vpn.service.js';
 import { CoverLetterService, ResumeService } from '../services/resume.service.js';
 import { ApplicationService } from '../services/application.service.js';
 import { NotificationService } from '../services/notification.service.js';
@@ -75,13 +81,19 @@ export interface Container {
     notifications: NotificationRepository;
     sync: SyncRepository;
     commands: CommandRepository;
+    keywords: KeywordRepository;
   };
 
   services: {
     settings: SettingsService;
     llm: LlmService;
+    latex: LatexService;
     documents: DocumentService;
     jobs: JobService;
+    keywords: KeywordService;
+    pipeline: PipelineService;
+    sources: SourceService;
+    vpn: VpnService;
     resumes: ResumeService;
     coverLetters: CoverLetterService;
     applications: ApplicationService;
@@ -145,6 +157,7 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     notifications: new NotificationRepository(db),
     sync: new SyncRepository(db),
     commands: new CommandRepository(db),
+    keywords: new KeywordRepository(db),
   };
 
   const settingsService = new SettingsService(
@@ -206,7 +219,25 @@ export async function createContainer(config: AppConfig): Promise<Container> {
   );
 
   const documentService = new DocumentService(config.paths, browser, logger.child('documents'));
+  // Resumes are LaTeX documents compiled on this host; no rendering service and
+  // no font ever leaves the machine.
+  const latexService = new LatexService(config.paths, logger.child('latex'));
   const syncRepository = repositories.sync;
+
+  // Exit location. Off unless the user configures a backend, so a host with no
+  // VPN behaves exactly as before.
+  const vpnService = new VpnService(settingsService, logger.child('vpn'));
+
+  const keywordService = new KeywordService(
+    repositories.keywords,
+    settingsService,
+    llmService,
+    logger.child('keywords'),
+  );
+
+  // Settings is saved far more often than the Keywords screen is opened, so the
+  // keyword table is reconciled from the save path rather than from a button.
+  settingsService.onSearchKeywordsChanged(() => keywordService.handleSeedsChanged());
 
   const notificationService = new NotificationService(
     repositories.notifications,
@@ -229,6 +260,9 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     browser,
     settingsService,
     llmService,
+    keywordService,
+    credentialService,
+    vpnService,
     logger.child('jobs'),
     events,
   );
@@ -237,6 +271,7 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     repositories.resumes,
     repositories.jobs,
     documentService,
+    latexService,
     llmService,
     logger.child('resumes'),
   );
@@ -320,6 +355,19 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     logger.child('backups'),
   );
 
+  // Takes the keyword count as a callback rather than the service itself, so the
+  // per-source dashboard does not pull the keyword store into its dependencies.
+  const sourceService = new SourceService(
+    collectors,
+    settingsService,
+    credentialService,
+    repositories.collectorRuns,
+    repositories.analytics,
+    repositories.queue,
+    browser,
+    logger.child('sources'),
+  );
+
   const worker = new QueueWorker(
     repositories.queue,
     createHandlers({
@@ -337,6 +385,17 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     }),
     settingsService,
     logger.child('queue'),
+    events,
+  );
+
+  // Constructed after the worker because stopping a stage has to abort whatever
+  // that stage already has in flight, not merely stop queueing more of it.
+  const pipelineService = new PipelineService(
+    settingsService,
+    worker,
+    repositories.queue,
+    llmService,
+    logger.child('pipeline'),
     events,
   );
 
@@ -371,8 +430,13 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     services: {
       settings: settingsService,
       llm: llmService,
+      latex: latexService,
       documents: documentService,
       jobs: jobService,
+      keywords: keywordService,
+      pipeline: pipelineService,
+      sources: sourceService,
+      vpn: vpnService,
       resumes: resumeService,
       coverLetters: coverLetterService,
       applications: applicationService,

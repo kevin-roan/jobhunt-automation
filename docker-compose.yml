@@ -29,6 +29,23 @@ services:
       - deedy-data:/data
     # Chromium needs a larger shared-memory segment than Docker's 64MB default.
     shm_size: '1gb'
+    # Lets bubblewrap create the user namespace it sandboxes the TeX engine in.
+    #
+    # Resume LaTeX is attacker-influenced (it comes from the model, and the
+    # compile endpoint takes no authentication) and TeX is Turing-complete, so
+    # the regex denylist in front of it is a filter, not a boundary. The mount
+    # namespace is what actually stops a document reading DATA_DIR and returning
+    # the credential encryption key inside the PDF. Docker's default seccomp
+    # profile blocks the `unshare` that bubblewrap needs, so without this the
+    # container silently runs on the denylist alone — LatexService warns about
+    # exactly that at startup.
+    #
+    # If your policy forbids relaxing seccomp, drop these two lines and accept
+    # the weaker posture, or supply a custom profile that permits `unshare`
+    # and `clone` with CLONE_NEW*. Everything else keeps working either way.
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     healthcheck:

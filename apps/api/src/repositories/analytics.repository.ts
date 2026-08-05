@@ -11,6 +11,25 @@ interface SeriesRow {
   date: string;
   value: number;
 }
+interface SourceJobRow {
+  source: string;
+  totalJobs: number;
+  jobsToday: number;
+  scoredJobs: number;
+  averageScore: number | null;
+}
+interface SourceApplicationRow {
+  source: string;
+  applications: number;
+}
+
+export interface SourceJobStats {
+  totalJobs: number;
+  jobsToday: number;
+  scoredJobs: number;
+  averageScore: number | null;
+  applications: number;
+}
 
 /**
  * All analytics are computed from the durable tables on demand — there is no
@@ -115,6 +134,63 @@ export class AnalyticsRepository {
       llmTokensTotal: Number(llmStats?.tokens ?? 0),
       llmCallsTotal: Number(llmStats?.calls ?? 0),
     };
+  }
+
+  /**
+   * Per-source job counts, scored counts and mean score, for the sources
+   * dashboard. Two grouped queries rather than one pair per source: the
+   * registry can hold a dozen collectors and plugins add more.
+   */
+  perSourceJobStats(): Map<string, SourceJobStats> {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const jobRows = this.db.all<SourceJobRow>(sql`
+      SELECT
+        source AS source,
+        count(*) AS totalJobs,
+        sum(CASE WHEN substr(collected_at, 1, 10) = ${today} THEN 1 ELSE 0 END) AS jobsToday,
+        sum(CASE WHEN score IS NOT NULL THEN 1 ELSE 0 END) AS scoredJobs,
+        avg(score) AS averageScore
+      FROM jobs WHERE archived = 0
+      GROUP BY source
+    `);
+
+    // Applications are counted regardless of `archived`: archiving the job does
+    // not un-send the application, and the tile reports what the source produced.
+    const applicationRows = this.db.all<SourceApplicationRow>(sql`
+      SELECT j.source AS source, count(*) AS applications
+      FROM applications a
+      INNER JOIN jobs j ON j.id = a.job_id
+      GROUP BY j.source
+    `);
+
+    const stats = new Map<string, SourceJobStats>();
+    for (const row of jobRows) {
+      const average = row.averageScore;
+      stats.set(row.source, {
+        totalJobs: Number(row.totalJobs),
+        jobsToday: Number(row.jobsToday),
+        scoredJobs: Number(row.scoredJobs),
+        averageScore: average === null ? null : Math.round(Number(average) * 10) / 10,
+        applications: 0,
+      });
+    }
+    for (const row of applicationRows) {
+      const existing = stats.get(row.source);
+      if (existing) {
+        existing.applications = Number(row.applications);
+        continue;
+      }
+      // A source whose jobs are all archived still has applications to report.
+      stats.set(row.source, {
+        totalJobs: 0,
+        jobsToday: 0,
+        scoredJobs: 0,
+        averageScore: null,
+        applications: Number(row.applications),
+      });
+    }
+    return stats;
   }
 
   full(days: number): AnalyticsPayload {

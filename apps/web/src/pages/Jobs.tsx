@@ -4,14 +4,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Archive, ExternalLink, RefreshCw, Search, Sparkles } from 'lucide-react';
 import { JOB_STATUSES, type JobStatus } from '@deedy/shared';
 import { api } from '@/lib/api';
-import { formatSalary, relativeTime } from '@/lib/utils';
-import {
-  ErrorState,
-  LoadingRows,
-  PageHeader,
-  ScoreBadge,
-  StatusBadge,
-} from '@/components/common';
+import { cn, formatSalary, relativeTime } from '@/lib/utils';
+import { ErrorState, LoadingRows, PageHeader, ScoreBadge, StatusBadge } from '@/components/common';
+import { SourceBadge, SourceIcon, sourceAccent, sourceLabel } from '@/components/sources';
 import { Button, EmptyState, Input, Select } from '@/components/ui/primitives';
 import { Pagination, TBody, TD, TH, THead, TR, Table, TableWrapper } from '@/components/ui/table';
 import { useToast } from '@/components/ui/toast';
@@ -93,7 +88,7 @@ export default function JobsPage(): JSX.Element {
         }
       />
 
-      <div className="mb-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-6">
+      <div className="mb-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
         <div className="relative sm:col-span-2">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
@@ -117,20 +112,6 @@ export default function JobsPage(): JSX.Element {
             </option>
           ))}
         </Select>
-        <Select
-          value={source}
-          onChange={(event) => {
-            setSource(event.target.value);
-            setPage(1);
-          }}
-        >
-          <option value="">All sources</option>
-          {(sources.data?.sources ?? []).map((value) => (
-            <option key={value} value={value}>
-              {value}
-            </option>
-          ))}
-        </Select>
         <Input
           type="number"
           min={0}
@@ -150,7 +131,58 @@ export default function JobsPage(): JSX.Element {
         </Select>
       </div>
 
-      <div className="mb-3 flex items-center gap-2 text-xs">
+      <div className="mb-3 flex flex-wrap items-center gap-1.5 text-xs">
+        <button
+          type="button"
+          onClick={() => {
+            setSource('');
+            setPage(1);
+          }}
+          aria-pressed={source === ''}
+          className={cn(
+            'rounded-full border px-2.5 py-1 font-medium transition-colors',
+            source === ''
+              ? 'border-transparent bg-primary text-primary-foreground'
+              : 'border-border text-muted-foreground hover:bg-secondary',
+          )}
+        >
+          All sources
+        </button>
+        {(sources.data?.sources ?? []).map((value) => {
+          const active = source === value;
+          const accent = sourceAccent(value);
+          return (
+            <button
+              key={value}
+              type="button"
+              onClick={() => {
+                setSource(active ? '' : value);
+                setPage(1);
+              }}
+              aria-pressed={active}
+              title={
+                active
+                  ? `Clear the ${sourceLabel(value)} filter`
+                  : `Show only ${sourceLabel(value)} jobs`
+              }
+              className={cn(
+                'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-medium transition-colors',
+                active
+                  ? cn('border-transparent ring-1 ring-inset', accent.bg, accent.text, accent.ring)
+                  : 'border-border text-muted-foreground hover:bg-secondary',
+              )}
+            >
+              <SourceIcon
+                source={value}
+                className={cn('size-3.5', active ? undefined : accent.text)}
+              />
+              {sourceLabel(value)}
+            </button>
+          );
+        })}
+
+        <span className="ml-auto" />
+
         <button
           type="button"
           onClick={() => {
@@ -181,7 +213,7 @@ export default function JobsPage(): JSX.Element {
                 <TH>Role</TH>
                 <TH className="hidden md:table-cell">Location</TH>
                 <TH className="hidden lg:table-cell">Salary</TH>
-                <TH className="hidden sm:table-cell">Source</TH>
+                <TH>Source</TH>
                 <TH>Status</TH>
                 <TH className="hidden xl:table-cell">Collected</TH>
                 <TH className="w-28 text-right">Actions</TH>
@@ -194,7 +226,10 @@ export default function JobsPage(): JSX.Element {
                     <ScoreBadge score={job.score} />
                   </TD>
                   <TD className="max-w-[22rem]">
-                    <Link to={`/jobs/${job.id}`} className="block truncate font-medium hover:underline">
+                    <Link
+                      to={`/jobs/${job.id}`}
+                      className="block truncate font-medium hover:underline"
+                    >
                       {job.title}
                     </Link>
                     <span className="block truncate text-xs text-muted-foreground">
@@ -205,9 +240,16 @@ export default function JobsPage(): JSX.Element {
                     {job.location ?? '—'}
                   </TD>
                   <TD className="tabular hidden text-xs text-muted-foreground lg:table-cell">
-                    {formatSalary(job.salaryMin, job.salaryMax, job.salaryCurrency, job.salaryPeriod)}
+                    {formatSalary(
+                      job.salaryMin,
+                      job.salaryMax,
+                      job.salaryCurrency,
+                      job.salaryPeriod,
+                    )}
                   </TD>
-                  <TD className="hidden text-xs text-muted-foreground sm:table-cell">{job.source}</TD>
+                  <TD>
+                    <SourceBadge source={job.source} />
+                  </TD>
                   <TD>
                     <StatusBadge status={job.status} />
                   </TD>
@@ -220,8 +262,11 @@ export default function JobsPage(): JSX.Element {
                         variant="ghost"
                         size="icon"
                         title="Score with the local LLM"
+                        aria-label={`Score ${job.title} with the local LLM`}
                         onClick={() => scoreJob.mutate(job.id)}
-                        disabled={scoreJob.isPending}
+                        // Scoped to this row: one queued scoring must not freeze
+                        // the button on every other job in the table.
+                        disabled={scoreJob.isPending && scoreJob.variables === job.id}
                       >
                         <Sparkles />
                       </Button>
@@ -229,11 +274,18 @@ export default function JobsPage(): JSX.Element {
                         variant="ghost"
                         size="icon"
                         title={job.archived ? 'Unarchive' : 'Archive'}
+                        aria-label={`${job.archived ? 'Unarchive' : 'Archive'} ${job.title}`}
                         onClick={() => archiveJob.mutate({ id: job.id, value: !job.archived })}
                       >
                         <Archive />
                       </Button>
-                      <Button variant="ghost" size="icon" title="Open posting" asChild>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        title="Open posting"
+                        aria-label={`Open the posting for ${job.title} at ${job.company}`}
+                        asChild
+                      >
                         <a href={job.applicationUrl} target="_blank" rel="noreferrer">
                           <ExternalLink />
                         </a>

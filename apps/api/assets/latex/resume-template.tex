@@ -1,0 +1,72 @@
+%% Starter resume. Compile with XeLaTeX or LuaLaTeX; deedy-resume-openfont.cls
+%% must sit beside this file (the renderer copies it in automatically).
+%%
+%% Replace every REDACTED placeholder with your own details. The \cvtheme line
+%% is written by the editor's theme panel -- edit it there or here, either way.
+\documentclass{deedy-resume-openfont}
+
+\begin{document}
+
+%-----------HEADER-----------
+\cvmeta{REDACTED NAME}{Your Role}
+\namesection{First}{Last}{Your Role}
+
+\linksline{
+  City, Country \sep
+  \href{mailto:REDACTED}{REDACTED} \sep
+  \href{https://example.com}{example.com} \sep
+  \href{https://www.linkedin.com/in/REDACTED/}{linkedin.com/in/REDACTED} \sep
+  \href{https://github.com/REDACTED}{github.com/REDACTED}
+}
+
+%-----------SUMMARY-----------
+\section{Summary}
+
+\custombold{One line on what you build}, with \custombold{N years} of experience and the
+single most convincing number you have. Name the stack you actually own, then say what
+you can carry end to end. Two or three sentences; no adjectives you cannot evidence.
+
+%-----------SKILLS-----------
+\section{Skills}
+
+\skillrow{Languages}{\custombold{TypeScript} \sep \custombold{Python} \sep SQL \sep Bash}
+\skillrow{Frontend}{\custombold{React} \sep Next.js \sep TailwindCSS}
+\skillrow{Backend}{\custombold{Node.js} \sep PostgreSQL \sep REST APIs}
+\skillrow{Infrastructure}{Docker \sep CI/CD \sep Linux}
+
+%-----------EXPERIENCE-----------
+\section{Experience}
+
+\entryline{\runsubsection{Company Name}}{\location{Mon 20XX -- Present}}
+\entryline{\descript{Your Title}}{\location{On-site, City}}
+\begin{tightemize}
+  \item Shipped something measurable, with the number attached.
+  \item Owned a system end to end, from the interface down to the deploy.
+  \item Cut a cost or a latency figure, and say by how much.
+\end{tightemize}
+
+\entrysep
+\entryline{\runsubsection{Previous Company}}{\location{Mon 20XX -- Mon 20XX}}
+\entryline{\descript{Your Title}}{\location{Remote}}
+\begin{tightemize}
+  \item One bullet per genuinely distinct thing you did.
+  \item Lead with the outcome, then the technology that produced it.
+\end{tightemize}
+
+%-----------PROJECTS-----------
+\section{Projects}
+
+\entryline{\runsubsection{Project Name} \location{-- one-line framing}}{\location{\href{https://example.com}{Demo} \sep \href{https://github.com/REDACTED}{Source}}}
+\descript{React, Node.js, PostgreSQL, Docker}
+\begin{tightemize}
+  \item What it does and who uses it, in one sentence.
+  \item The hardest technical problem in it, and how you solved it.
+\end{tightemize}
+
+%-----------EDUCATION-----------
+\section{Education}
+
+\entryline{\runsubsection{University Name}}{\location{20XX -- 20XX}}
+\entryline{\descript{Degree, Field}}{\location{City, Country}}
+
+\end{document}

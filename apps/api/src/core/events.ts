@@ -21,6 +21,13 @@ export interface AppEvents {
   'llm.call': { task: string; model: string; success: boolean; totalTokens: number | null };
   'collector.run': { collectorId: string; found: number; inserted: number; duplicates: number };
   'settings.updated': { sections: string[] };
+  /** A pipeline stage (or the master switch) was started or stopped. */
+  'pipeline.changed': {
+    stage: string | null;
+    action: 'start' | 'stop';
+    enabled: boolean;
+    aborted: number;
+  };
   log: { level: string; scope: string; message: string; createdAt: string };
 }
 

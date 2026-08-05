@@ -10,6 +10,10 @@ import { observabilityRoutes } from './observability.routes.js';
 import { credentialsRoutes } from './credentials.routes.js';
 import { notificationRoutes } from './notifications.routes.js';
 import { syncRoutes } from './sync.routes.js';
+import { keywordRoutes } from './keywords.routes.js';
+import { pipelineRoutes } from './pipeline.routes.js';
+import { sourceRoutes } from './sources.routes.js';
+import { vpnRoutes } from './vpn.routes.js';
 
 export async function registerRoutes(app: ApiInstance, container: Container): Promise<void> {
   await healthRoutes(app, container);
@@ -22,4 +26,8 @@ export async function registerRoutes(app: ApiInstance, container: Container): Pr
   await credentialsRoutes(app, container);
   await notificationRoutes(app, container);
   await syncRoutes(app, container);
+  await keywordRoutes(app, container);
+  await pipelineRoutes(app, container);
+  await sourceRoutes(app, container);
+  await vpnRoutes(app, container);
 }

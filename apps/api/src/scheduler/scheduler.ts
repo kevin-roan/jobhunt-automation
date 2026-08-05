@@ -1,5 +1,7 @@
+import type { PipelineStage } from '@deedy/shared';
 import type { Logger } from '../core/logger.js';
 import { toErrorMessage } from '../core/errors.js';
+import { isPipelineStageEnabled } from '../queue/worker.js';
 import type { JobRepository } from '../repositories/job.repository.js';
 import type { QueueRepository } from '../repositories/queue.repository.js';
 import type { SchedulerStateRepository } from '../repositories/browser.repository.js';
@@ -164,12 +166,19 @@ export interface CredentialNotifier {
 /** The standard set of recurring jobs that keep the pipeline moving. */
 export function createScheduledTasks(deps: SchedulerTaskDependencies): ScheduledTask[] {
   const settings = () => deps.settingsService.get();
+  /**
+   * A stopped stage must not accumulate a backlog while it is off, so the
+   * scheduler stops enqueuing for it too. This is the coarse half of the
+   * switch; the worker enforces the fine half by refusing to claim.
+   */
+  const stageRuns = (stage: PipelineStage) => isPipelineStageEnabled(settings().pipeline, stage);
 
   return [
     {
       name: 'collect',
       intervalMinutes: () => settings().scheduler.collectIntervalMinutes,
       async run() {
+        if (!stageRuns('collect')) return;
         for (const collectorId of deps.jobService.plannedCollectors()) {
           deps.queue.enqueue({
             task: 'collect.jobs',
@@ -184,6 +193,11 @@ export function createScheduledTasks(deps: SchedulerTaskDependencies): Scheduled
       name: 'score',
       intervalMinutes: () => settings().scheduler.scoreIntervalMinutes,
       async run() {
+        // The task is named for scoring but everything it enqueues is a
+        // `job.enrich`, so the enrich switch alone decides. Gating on `score`
+        // too would mean stopping scoring — the obvious way to free the LLM —
+        // silently starved enrichment as well, even with its own switch on.
+        if (!stageRuns('enrich')) return;
         const pending = deps.jobs.pendingScoring(50);
         for (const job of pending) {
           deps.queue.enqueue({
@@ -199,6 +213,7 @@ export function createScheduledTasks(deps: SchedulerTaskDependencies): Scheduled
       name: 'apply',
       intervalMinutes: () => settings().scheduler.applyIntervalMinutes,
       async run() {
+        if (!stageRuns('apply')) return;
         const application = settings().application;
         if (!application.autoApply) return;
 

@@ -2,9 +2,14 @@ import { createReadStream, existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import {
+  assistResumeResultSchema,
+  assistResumeSchema,
+  compileResumeResultSchema,
+  compileResumeSchema,
   coverLetterDtoSchema,
   createResumeSchema,
   resumeDtoSchema,
+  resumeTemplateSchema,
   updateResumeSchema,
 } from '@deedy/shared';
 import { NotFoundError, ValidationError } from '../../core/errors.js';
@@ -16,6 +21,7 @@ const CONTENT_TYPES: Record<string, string> = {
   '.pdf': 'application/pdf',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   '.md': 'text/markdown; charset=utf-8',
+  '.tex': 'application/x-tex; charset=utf-8',
   '.png': 'image/png',
   '.html': 'text/html; charset=utf-8',
   '.json': 'application/json',
@@ -50,6 +56,65 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
     }),
   );
 
+  // Registered BEFORE `GET /resumes/:id` or Fastify will match "template" as an
+  // id — `idParamSchema` coerces to a number so it would 400 instead of 404.
+  app.get(
+    '/resumes/template',
+    {
+      schema: {
+        tags: ['resumes'],
+        summary: 'Starter LaTeX document, default theme and macro cheatsheet',
+        description:
+          "Everything the editor needs for a blank slate, plus the host's resolved LaTeX engine (null when none is installed).",
+        response: { 200: resumeTemplateSchema, ...commonErrors },
+      },
+    },
+    async () => container.services.latex.template(),
+  );
+
+  app.post(
+    '/resumes/compile',
+    {
+      // The global limit is 16MB, sized for uploads. This route hands its body
+      // to a TeX engine and takes no authentication, so it gets a limit sized
+      // for a resume instead: the schema already caps `latex` at 400k, and
+      // rejecting at the socket costs less than parsing 16MB to reject at zod.
+      bodyLimit: 1024 * 1024,
+      schema: {
+        tags: ['resumes'],
+        summary: 'Compile LaTeX to a preview PDF without saving it',
+        description:
+          'Drives the editor live preview; nothing is persisted. A failed compile is a 200 with `ok:false` and the engine log, not an error status — the editor renders the log.',
+        body: compileResumeSchema,
+        response: { 200: compileResumeResultSchema, ...commonErrors },
+      },
+    },
+    async (request) => container.services.latex.compilePreview(request.body),
+  );
+
+  // Also before `/resumes/:id`: literal segments must beat the parameterised one.
+  app.get(
+    '/resumes/preview/:previewId',
+    {
+      schema: {
+        tags: ['resumes'],
+        summary: 'Stream a compiled preview PDF',
+        params: z.object({ previewId: z.string().min(1).max(100) }),
+      },
+    },
+    async (request, reply) => {
+      const previewPath = container.services.latex.previewPath(request.params.previewId);
+      if (!previewPath) throw new NotFoundError('Resume preview', request.params.previewId);
+
+      const resolved = assertInsideDataDir(previewPath);
+      // Displayed in an `<iframe>` by the editor, so inline rather than attachment.
+      return reply
+        .type('application/pdf')
+        .header('content-disposition', 'inline')
+        .send(createReadStream(resolved));
+    },
+  );
+
   app.get(
     '/resumes/:id',
     {
@@ -72,7 +137,7 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
     {
       schema: {
         tags: ['resumes'],
-        summary: 'Create a resume from Markdown and render its PDF and DOCX',
+        summary: 'Create a resume from LaTeX and render its PDF and DOCX',
         body: createResumeSchema,
         response: { 201: resumeDtoSchema, ...commonErrors },
       },
@@ -89,7 +154,8 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
       schema: {
         tags: ['resumes'],
         summary: 'Update a resume',
-        description: 'Changing the Markdown creates a new version rather than editing in place.',
+        description:
+          'Changing the LaTeX or the theme creates a new version rather than editing in place.',
         params: idParamSchema,
         body: updateResumeSchema,
         response: { 200: resumeDtoSchema, ...commonErrors },
@@ -159,6 +225,22 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
     },
   );
 
+  app.post(
+    '/resumes/:id/assist',
+    {
+      schema: {
+        tags: ['resumes'],
+        summary: 'Edit a resume with a free-text instruction',
+        description:
+          'Runs the local model over the document and returns the edited LaTeX without saving it; POST the result back to persist. Can take a while on CPU inference.',
+        params: idParamSchema,
+        body: assistResumeSchema,
+        response: { 200: assistResumeResultSchema, ...commonErrors },
+      },
+    },
+    async (request) => container.services.resumes.assist(request.params.id, request.body),
+  );
+
   app.get(
     '/resumes/:id/download',
     {
@@ -166,19 +248,29 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
         tags: ['resumes'],
         summary: 'Download a rendered resume',
         params: idParamSchema,
-        querystring: z.object({ format: z.enum(['pdf', 'docx', 'md']).default('pdf') }),
+        querystring: z.object({ format: z.enum(['pdf', 'docx', 'txt', 'tex']).default('pdf') }),
       },
     },
     async (request, reply) => {
       const row = resumes.byId(request.params.id);
       if (!row) throw new NotFoundError('Resume', request.params.id);
 
-      const target =
-        request.query.format === 'pdf'
-          ? row.pdfPath
-          : request.query.format === 'docx'
-            ? row.docxPath
-            : row.filePath;
+      // The plain-text mirror is derived from the LaTeX on every render and kept
+      // in the row rather than on disk, so it is served from the column instead
+      // of streamed. It is what an ATS parser and the scoring prompt actually
+      // see, which makes it worth exposing on its own.
+      if (request.query.format === 'txt') {
+        return reply
+          .type('text/plain; charset=utf-8')
+          .header('content-disposition', `attachment; filename="resume-v${row.version}.txt"`)
+          .send(row.markdown);
+      }
+
+      const target = {
+        pdf: row.pdfPath,
+        docx: row.docxPath,
+        tex: row.texPath,
+      }[request.query.format];
       if (!target) {
         throw new NotFoundError(`Rendered ${request.query.format} for resume`, request.params.id);
       }

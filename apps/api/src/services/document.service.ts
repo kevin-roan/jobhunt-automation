@@ -106,6 +106,34 @@ export class DocumentService {
     return { markdownPath, pdfPath, docxPath };
   }
 
+  /**
+   * DOCX from already-derived plain text. LaTeX resumes get their PDF from the
+   * engine, so they must not go through the Markdown/Chromium path — but some
+   * portals still reject PDFs, so a .docx is produced from the text mirror.
+   * Returns null when writing fails; a missing .docx must not fail a render.
+   */
+  async renderPlainTextDocx(
+    text: string,
+    title: string,
+    baseName: string,
+    kind: 'resume' | 'cover-letter',
+  ): Promise<string | null> {
+    const dir = kind === 'resume' ? this.paths.resumes : this.paths.coverLetters;
+    const docxPath = path.join(dir, `${slugify(baseName)}-${Date.now()}.docx`);
+    try {
+      // Plain text is a valid degenerate case of the Markdown subset below:
+      // it has no headings or bullets, so every line becomes a paragraph.
+      await writeFile(docxPath, await this.markdownToDocx(text, title));
+      return docxPath;
+    } catch (error) {
+      this.logger.error('plain text docx rendering failed', {
+        baseName,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    }
+  }
+
   /** Converts the Markdown subset resumes actually use into a clean DOCX. */
   async markdownToDocx(markdown: string, title: string): Promise<Buffer> {
     const children: Paragraph[] = [];

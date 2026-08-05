@@ -12,18 +12,38 @@ function trimTrailingSlash(url: string): string {
   return url.replace(/\/+$/, '');
 }
 
+/**
+ * A request the caller stopped — pressing Stop on the dashboard, not a fault of
+ * the model or the endpoint. It is deliberately distinct from a timeout so the
+ * retry loop can tell "the user wants the machine back" apart from "that
+ * attempt failed, try again"; collapsing the two is what made Stop launch fresh
+ * generations instead of ending them.
+ */
+export class LlmAbortError extends LlmError {
+  constructor(message = 'LLM request was cancelled by the caller') {
+    super(message);
+  }
+}
+
 async function fetchJson(
   url: string,
   init: RequestInit,
   timeoutMs: number,
   externalSignal?: AbortSignal,
 ): Promise<unknown> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const onAbort = () => controller.abort();
-  externalSignal?.addEventListener('abort', onAbort);
+  // Bail before touching the network: an already-stopped caller must never
+  // cause a socket to open, or the "cancelled" work simply restarts here.
+  if (externalSignal?.aborted) throw new LlmAbortError();
+
+  // One composed signal instead of hand-wired listeners, so the signal handed
+  // to fetch is the same object that is already aborted when the caller stops.
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = externalSignal
+    ? AbortSignal.any([externalSignal, timeoutSignal])
+    : timeoutSignal;
+
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    const response = await fetch(url, { ...init, signal });
     const text = await response.text();
     if (!response.ok) {
       throw new LlmError(`LLM endpoint returned ${response.status}: ${text.slice(0, 500)}`);
@@ -35,15 +55,15 @@ async function fetchJson(
     }
   } catch (error) {
     if (error instanceof LlmError) throw error;
-    if (error instanceof Error && error.name === 'AbortError') {
+    // Abort identity is preserved: the caller's stop is reported as an abort,
+    // and only a genuine timeout is reported as one.
+    if (externalSignal?.aborted) throw new LlmAbortError();
+    if (timeoutSignal.aborted) {
       throw new LlmError(`LLM request timed out after ${timeoutMs}ms`);
     }
     throw new LlmError(
       `Could not reach LLM endpoint at ${url}: ${error instanceof Error ? error.message : String(error)}`,
     );
-  } finally {
-    clearTimeout(timer);
-    externalSignal?.removeEventListener('abort', onAbort);
   }
 }
 
@@ -198,6 +218,9 @@ export class OllamaClient implements LlmClient {
         request.signal,
       )) as OllamaChatResponse;
     } catch (error) {
+      // A cancelled request is never retried — the fallback would start a second
+      // generation on a machine the user just asked to free.
+      if (error instanceof LlmAbortError) throw error;
       // Older Ollama builds and non-reasoning models reject `think`. Fall back
       // once, then remember so later calls skip the wasted round trip.
       const message = error instanceof Error ? error.message : String(error);

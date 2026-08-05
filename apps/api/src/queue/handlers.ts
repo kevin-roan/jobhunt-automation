@@ -10,7 +10,7 @@ import type { JobService } from '../services/job.service.js';
 import type { ResumeService, CoverLetterService } from '../services/resume.service.js';
 import type { BackupService } from '../services/backup.service.js';
 import type { SettingsService } from '../services/settings.service.js';
-import type { TaskHandlerMap } from './worker.js';
+import type { TaskHandler, TaskHandlerMap } from './worker.js';
 
 const collectPayload = z.object({ collectorId: z.string().min(1) });
 const jobPayload = z.object({ jobId: z.number().int().positive() });
@@ -56,12 +56,18 @@ export interface HandlerDependencies {
 /**
  * Wires every queue task to its service call. Handlers are thin: they validate
  * the payload, delegate, and let the worker own retries and persistence.
+ *
+ * Every handler receives the worker's abort signal and hands it to the service
+ * it calls, so stopping a stage from the dashboard cancels the inference that
+ * is running right now instead of waiting for it — and for the calls queued
+ * behind it — to finish.
  */
 export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
-  const handlers: Record<QueueTask, (payload: unknown) => Promise<void>> = {
-    'collect.jobs': async (payload) => {
+  const handlers: Record<QueueTask, TaskHandler> = {
+    'collect.jobs': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const { collectorId } = parse(collectPayload, payload);
-      const summary = await deps.jobService.runCollector(collectorId);
+      const summary = await deps.jobService.runCollector(collectorId, signal);
 
       // Newly collected jobs are queued for scoring immediately.
       if (summary.inserted > 0) {
@@ -77,9 +83,12 @@ export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
       }
     },
 
-    'job.enrich': async (payload) => {
+    // `enrich` runs up to four generations in sequence; the signal cancels the
+    // one in flight and stops the rest from starting.
+    'job.enrich': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const { jobId } = parse(jobPayload, payload);
-      await deps.jobService.enrich(jobId);
+      await deps.jobService.enrich(jobId, signal);
       deps.queue.enqueue({
         task: 'job.score',
         payload: { jobId },
@@ -88,9 +97,10 @@ export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
       });
     },
 
-    'job.score': async (payload) => {
+    'job.score': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const { jobId, resumeId } = parse(scorePayload, payload);
-      const result = await deps.jobService.score(jobId, resumeId ?? null);
+      const result = await deps.jobService.score(jobId, resumeId ?? null, signal);
 
       const settings = deps.settingsService.get().application;
       if (
@@ -107,31 +117,41 @@ export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
       }
     },
 
-    'resume.tailor': async (payload) => {
+    // Tailoring is a two-call sequence inside the service; the signal cancels
+    // the call in flight and skips the one that would follow it.
+    'resume.tailor': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const input = parse(tailorPayload, payload);
       await deps.resumeService.tailorForJob({
         jobId: input.jobId,
         baseResumeId: input.baseResumeId ?? null,
         force: input.force ?? false,
+        signal,
       });
     },
 
-    'cover_letter.generate': async (payload) => {
+    'cover_letter.generate': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const input = parse(coverLetterPayload, payload);
       await deps.coverLetterService.generate({
         jobId: input.jobId,
         resumeId: input.resumeId ?? null,
+        signal,
       });
     },
 
-    'application.apply': async (payload) => {
+    // The browser session owns its own lifecycle, so an apply in progress
+    // finishes its current step; the abort takes effect before the next job.
+    'application.apply': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const input = parse(applyPayload, payload);
-      await deps.applicationService.apply(input);
+      await deps.applicationService.apply(input, signal);
     },
 
-    'company.summarize': async (payload) => {
+    'company.summarize': async (payload, _job, signal) => {
+      if (signal.aborted) return;
       const { companyId } = parse(companyPayload, payload);
-      await deps.jobService.summarizeCompany(companyId);
+      await deps.jobService.summarizeCompany(companyId, signal);
     },
 
     'maintenance.cleanup': async (payload) => {

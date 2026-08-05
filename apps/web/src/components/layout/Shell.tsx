@@ -14,13 +14,16 @@ import {
   ListChecks,
   Mail,
   Menu,
+  Radar,
   ScrollText,
   Settings as SettingsIcon,
   Sparkles,
+  Tags,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { Badge, Button } from '@/components/ui/primitives';
+import { PipelineStatusPill } from '@/components/PipelineControls';
 
 interface NavItem {
   to: string;
@@ -32,6 +35,8 @@ interface NavItem {
 const NAV: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, group: 'Pipeline' },
   { to: '/jobs', label: 'Jobs', icon: Briefcase, group: 'Pipeline' },
+  { to: '/sources', label: 'Sources', icon: Radar, group: 'Pipeline' },
+  { to: '/keywords', label: 'Keywords', icon: Tags, group: 'Pipeline' },
   { to: '/applications', label: 'Applications', icon: ListChecks, group: 'Pipeline' },
   { to: '/analytics', label: 'Analytics', icon: BarChart3, group: 'Pipeline' },
   { to: '/resumes', label: 'Resume Manager', icon: FileText, group: 'Documents' },
@@ -204,6 +209,7 @@ export function Shell({ children }: { children: React.ReactNode }): JSX.Element 
             )?.label ?? 'Deedy Automation'}
           </h1>
           <div className="ml-auto flex items-center gap-2">
+            <PipelineStatusPill />
             <HealthPill />
             <NotificationBell />
           </div>

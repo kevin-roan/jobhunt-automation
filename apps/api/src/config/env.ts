@@ -5,7 +5,14 @@ import { z } from 'zod';
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('production'),
-  HOST: z.string().default('0.0.0.0'),
+  /**
+   * Loopback by default. The API is unauthenticated and now also drives a LaTeX
+   * compiler and a local model, and the product's promise is that nothing
+   * leaves the machine — so binding the LAN has to be a deliberate act. The
+   * container images set HOST=0.0.0.0 explicitly, because there the network
+   * boundary is Docker's published port.
+   */
+  HOST: z.string().default('127.0.0.1'),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   /** Root for every piece of persisted state. Bind-mount this in Docker. */
   DATA_DIR: z.string().default('./data'),

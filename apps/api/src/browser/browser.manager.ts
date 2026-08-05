@@ -12,7 +12,7 @@ import {
 import type { BrowserEngine, BrowserSettings } from '@deedy/shared';
 import type { AppPaths } from '../config/env.js';
 import type { Logger } from '../core/logger.js';
-import { AppError } from '../core/errors.js';
+import { AppError, ConfigurationError } from '../core/errors.js';
 import { nowIso, slugify } from '../core/utils.js';
 import type { BrowserSessionRepository } from '../repositories/browser.repository.js';
 import type { SettingsService } from '../services/settings.service.js';
@@ -146,17 +146,32 @@ export class BrowserManager {
       headless: settings.headless,
     });
 
-    const context = await engine.launchPersistentContext(profilePath, {
-      headless: settings.headless,
-      slowMo: settings.slowMoMs,
-      // "chrome" uses the branded Google Chrome build when it is installed.
-      ...(settings.engine === 'chrome' ? { channel: 'chrome' } : {}),
-      args:
-        settings.engine === 'firefox'
-          ? []
-          : ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
-      ...this.contextOptions(settings),
-    });
+    let context: BrowserContext;
+    try {
+      context = await engine.launchPersistentContext(profilePath, {
+        headless: settings.headless,
+        slowMo: settings.slowMoMs,
+        // "chrome" uses the branded Google Chrome build when it is installed.
+        ...(settings.engine === 'chrome' ? { channel: 'chrome' } : {}),
+        args:
+          settings.engine === 'firefox'
+            ? []
+            : ['--disable-blink-features=AutomationControlled', '--no-sandbox'],
+        ...this.contextOptions(settings),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      // A host that never ran `playwright install` fails here with a wall of
+      // ASCII art. LinkedIn and Indeed are browser-only, so this is the single
+      // most likely reason they "do not work" — surface the one command that
+      // fixes it instead of a 500 with a stack trace.
+      if (/Executable doesn't exist|please run the following command/i.test(message)) {
+        throw new ConfigurationError(
+          `The ${settings.engine} browser is not installed, so browser-driven sources (LinkedIn, Indeed, and form filling) cannot run. Fix: run "npx playwright install ${settings.engine === 'firefox' ? 'firefox' : 'chromium'}" on this host.`,
+        );
+      }
+      throw error;
+    }
 
     context.setDefaultNavigationTimeout(settings.navigationTimeoutMs);
     context.setDefaultTimeout(settings.actionTimeoutMs);
@@ -180,9 +195,51 @@ export class BrowserManager {
   }
 
   /**
+   * `addCookies` is all-or-nothing: one malformed entry rejects the whole array
+   * and the session silently applies nothing. So we try the batch, and on any
+   * failure re-add cookies one at a time - a single bad entry must never cost
+   * the whole session. Names only are logged, never values.
+   */
+  private async addCookiesResiliently(
+    provider: string,
+    context: BrowserContext,
+    cookies: PlaywrightCookies,
+  ): Promise<{ applied: number; rejected: string[] }> {
+    if (cookies.length === 0) return { applied: 0, rejected: [] };
+
+    try {
+      await context.addCookies(cookies);
+      return { applied: cookies.length, rejected: [] };
+    } catch (error) {
+      this.logger.debug('batch cookie injection failed, retrying one at a time', {
+        provider,
+        cookies: cookies.length,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    let applied = 0;
+    const rejected: string[] = [];
+    for (const cookie of cookies) {
+      try {
+        await context.addCookies([cookie]);
+        applied += 1;
+      } catch (error) {
+        rejected.push(cookie.name);
+        this.logger.debug('cookie rejected by the browser', {
+          provider,
+          cookie: cookie.name,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    return { applied, rejected };
+  }
+
+  /**
    * Replays a pasted session into a live context. A malformed cookie must never
    * stop the browser from opening, so every failure is downgraded to a status
-   * update. Values are never logged - only counts.
+   * update. Values are never logged - only counts and names.
    */
   private async injectCredentials(provider: string, context: BrowserContext): Promise<number> {
     const store = this.credentials;
@@ -204,7 +261,19 @@ export class BrowserManager {
         ...(cookie.sameSite ? { sameSite: cookie.sameSite } : {}),
       }));
 
-      if (cookies.length > 0) await context.addCookies(cookies);
+      const { applied, rejected } = await this.addCookiesResiliently(provider, context, cookies);
+      if (rejected.length > 0) {
+        store.setStatus(
+          provider,
+          applied > 0 ? 'valid' : 'invalid',
+          `The browser rejected ${rejected.length} of ${cookies.length} cookies: ${rejected.join(', ')}.`,
+        );
+        this.logger.warn('some cookies were rejected by the browser', {
+          provider,
+          applied,
+          rejected,
+        });
+      }
 
       const origins = credential.origins.filter((entry) => entry.localStorage.length > 0);
       if (origins.length > 0) {
@@ -224,10 +293,11 @@ export class BrowserManager {
       store.markUsed(provider);
       this.logger.info('applied stored credentials', {
         provider,
-        cookies: cookies.length,
+        applied,
+        rejected: rejected.length,
         origins: origins.length,
       });
-      return cookies.length;
+      return applied;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       store.setStatus(provider, 'invalid', message);
@@ -245,9 +315,62 @@ export class BrowserManager {
     return this.injectCredentials(provider, context);
   }
 
+  /** Cookies currently live in the context for a provider, by name only. */
+  async liveCookieNames(provider: string): Promise<string[]> {
+    const { context } = await this.contextFor(provider);
+    try {
+      const cookies = await context.cookies();
+      return Array.from(new Set(cookies.map((cookie) => cookie.name))).sort();
+    } catch (error) {
+      this.logger.debug('could not read live cookies', {
+        provider,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return [];
+    }
+  }
+
+  /**
+   * Re-injects the stored session if a required cookie is missing from the live
+   * context. Returns true when the session looks present afterwards.
+   */
+  async ensureSession(provider: string, requiredCookies: string[]): Promise<boolean> {
+    if (requiredCookies.length === 0) return true;
+
+    const present = new Set(await this.liveCookieNames(provider));
+    const missing = requiredCookies.filter((name) => !present.has(name));
+    if (missing.length === 0) return true;
+
+    // The site may have cleared the cookie, or the user pasted a fresh session
+    // while this context was already open; either way, replay the stored one.
+    this.logger.info('re-applying stored session, required cookies missing', {
+      provider,
+      missing,
+    });
+    await this.applyCredentialsToContext(provider);
+
+    const after = new Set(await this.liveCookieNames(provider));
+    const stillMissing = requiredCookies.filter((name) => !after.has(name));
+    if (stillMissing.length > 0) {
+      this.credentials?.setStatus(
+        provider,
+        'invalid',
+        `Required cookies are still missing after re-injection: ${stillMissing.join(', ')}.`,
+      );
+      this.logger.warn('session could not be restored', { provider, missing: stillMissing });
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Navigates to a probe URL and decides whether the session is still signed in.
-   * A match on the final URL or the page body means signed out.
+   *
+   * The final URL is authoritative: these sites bounce a dead session to a login
+   * or authwall URL. Only when the URL is clean do we look at the page, and then
+   * at `innerText` rather than the markup - a signed-in LinkedIn feed contains
+   * the string "login" in its HTML (script payloads, tracking URLs), which used
+   * to mark a perfectly healthy session as expired.
    */
   async isAuthenticated(
     provider: string,
@@ -257,8 +380,14 @@ export class BrowserManager {
     const page = await this.newPage(provider);
     try {
       await page.goto(probeUrl, { waitUntil: 'domcontentloaded' });
-      const signedOut =
-        signedOutPattern.test(page.url()) || signedOutPattern.test(await page.content());
+
+      let signedOut = signedOutPattern.test(page.url());
+      if (!signedOut) {
+        const text = await page
+          .evaluate(() => document.body?.innerText ?? '')
+          .catch(() => '');
+        signedOut = text.length > 0 && signedOutPattern.test(text);
+      }
       const note = signedOut ? 'probe reported signed out' : null;
 
       this.sessions.setLoggedIn(provider, !signedOut, note);

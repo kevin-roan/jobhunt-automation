@@ -4,10 +4,13 @@ import type {
   ApplicationDto,
   ApplicationEventDto,
   ArtifactDto,
+  AssistResumeResult,
   BrowserSessionDto,
   CollectorDto,
   CollectorRunDto,
+  CompileResumeResult,
   CoverLetterDto,
+  ExpandKeywordsResult,
   HealthPayload,
   JobDto,
   JobQuery,
@@ -19,14 +22,21 @@ import type {
   NotificationKind,
   OverviewStats,
   Paginated,
+  PipelineStage,
+  PipelineStatus,
   PromptTemplateDto,
   ProviderCredentialDto,
   QueueJobDto,
   ResumeDto,
+  ResumeTemplate,
+  ResumeTheme,
   SaveCredentialInput,
+  SearchKeywordDto,
   Settings,
   SettingsPatch,
+  SourceStatusDto,
   SyncStatus,
+  VpnStatusDto,
 } from '@deedy/shared';
 
 export class ApiError extends Error {
@@ -83,8 +93,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T;
 }
 
-const post = <T>(path: string, body?: unknown): Promise<T> =>
-  request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) });
+const post = <T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> =>
+  request<T>(path, {
+    method: 'POST',
+    body: body === undefined ? undefined : JSON.stringify(body),
+    ...(signal ? { signal } : {}),
+  });
 
 const patch = <T>(path: string, body: unknown): Promise<T> =>
   request<T>(path, { method: 'PATCH', body: JSON.stringify(body) });
@@ -212,29 +226,137 @@ export const api = {
     remove: (id: number): Promise<{ ok: true }> => del(`/answers/${id}`),
   },
 
+  /**
+   * Resumes are LaTeX documents for the deedy-resume-openfont class. The
+   * `latex` field is the source of truth; `markdown` is a derived plain-text
+   * mirror the scoring and cover-letter prompts read.
+   */
   resumes: {
     list: (includeGenerated = true): Promise<{ resumes: ResumeDto[] }> =>
       request(`/resumes${buildQuery({ includeGenerated })}`),
     get: (id: number): Promise<ResumeDto> => request(`/resumes/${id}`),
+    /** Starter document, default theme, macro cheatsheet and the host's engine. */
+    template: (): Promise<ResumeTemplate> => request('/resumes/template'),
     create: (body: {
       name: string;
-      markdown: string;
+      latex: string;
+      theme?: ResumeTheme;
       targetRole?: string;
       isBase?: boolean;
       isDefault?: boolean;
     }): Promise<ResumeDto> => post('/resumes', body),
     update: (
       id: number,
-      body: { name?: string; markdown?: string; targetRole?: string; isDefault?: boolean },
+      body: {
+        name?: string;
+        latex?: string;
+        theme?: ResumeTheme;
+        targetRole?: string;
+        isDefault?: boolean;
+      },
     ): Promise<ResumeDto> => patch(`/resumes/${id}`, body),
     remove: (id: number): Promise<{ ok: true }> => del(`/resumes/${id}`),
+    /** Compile without saving; drives the editor's live PDF preview. */
+    /**
+     * `signal` lets the editor drop a superseded compile. It abandons the
+     * response, not the build — the engine runs to completion or hits its own
+     * timeout on the host either way.
+     */
+    compile: (
+      body: { latex: string; theme?: ResumeTheme },
+      signal?: AbortSignal,
+    ): Promise<CompileResumeResult> => post('/resumes/compile', body, signal),
+    previewUrl: (previewId: string): string => `${BASE}/resumes/preview/${previewId}`,
+    /** Free-text editing: "make it one page", "target this job", "warmer palette". */
+    assist: (
+      id: number,
+      body: { latex: string; theme?: ResumeTheme; instruction: string; jobId?: number | null },
+    ): Promise<AssistResumeResult> => post(`/resumes/${id}/assist`, body),
     tailor: (
       id: number,
       body: { jobId: number; force?: boolean; immediate?: boolean },
     ): Promise<{ resume: ResumeDto | null; queueJobId: number | null }> =>
       post(`/resumes/${id}/tailor`, body),
-    downloadUrl: (id: number, format: 'pdf' | 'docx' | 'md'): string =>
+    /** `txt` is the derived plain-text mirror — what an ATS parser sees. */
+    downloadUrl: (id: number, format: 'pdf' | 'docx' | 'txt' | 'tex'): string =>
       `${BASE}/resumes/${id}/download?format=${format}`,
+  },
+
+  /**
+   * Start/stop control for the pipeline. Inference is the expensive part, so
+   * every stage that calls the model can be stopped on its own; stopping also
+   * aborts what that stage already has in flight.
+   */
+  pipeline: {
+    status: (): Promise<PipelineStatus> => request('/pipeline'),
+    control: (body: {
+      stage?: PipelineStage;
+      action: 'start' | 'stop';
+      abortInFlight?: boolean;
+    }): Promise<PipelineStatus> => post('/pipeline/control', body),
+    start: (stage?: PipelineStage): Promise<PipelineStatus> =>
+      post('/pipeline/control', { stage, action: 'start' }),
+    stop: (stage?: PipelineStage, abortInFlight = true): Promise<PipelineStatus> =>
+      post('/pipeline/control', { stage, action: 'stop', abortInFlight }),
+  },
+
+  /**
+   * Exit-location control. Job boards are regional, so the exit country decides
+   * which index you actually search; it also spreads a slow crawl across
+   * addresses. It is not a way around anti-bot fingerprinting.
+   */
+  vpn: {
+    status: (): Promise<VpnStatusDto> => request('/vpn'),
+    control: (body: {
+      action: 'connect' | 'disconnect' | 'rotate';
+      country?: string;
+      force?: boolean;
+    }): Promise<VpnStatusDto> => post('/vpn/control', body),
+    connect: (country?: string): Promise<VpnStatusDto> =>
+      post('/vpn/control', { action: 'connect', country, force: true }),
+    disconnect: (): Promise<VpnStatusDto> => post('/vpn/control', { action: 'disconnect' }),
+    rotate: (): Promise<VpnStatusDto> => post('/vpn/control', { action: 'rotate', force: true }),
+  },
+
+  /** Per-platform state: LinkedIn, Indeed, Greenhouse and friends, side by side. */
+  sources: {
+    list: (): Promise<{ sources: SourceStatusDto[] }> => request('/sources'),
+    run: (
+      id: string,
+      immediate = false,
+    ): Promise<{ queueJobId: number | null; summary: unknown }> =>
+      post(`/sources/${encodeURIComponent(id)}/run`, { immediate }),
+    stop: (id: string): Promise<{ cancelled: number }> =>
+      post(`/sources/${encodeURIComponent(id)}/stop`),
+    setEnabled: (id: string, enabled: boolean): Promise<{ ok: true }> =>
+      post(`/sources/${encodeURIComponent(id)}/enabled`, { enabled }),
+  },
+
+  /**
+   * The terms collectors type into each platform's search box. User seeds and
+   * the model's expansions of them are the same kind of row, distinguished by
+   * `origin`, so both can be enabled, scoped and deleted individually.
+   */
+  keywords: {
+    list: (): Promise<{ keywords: SearchKeywordDto[] }> => request('/keywords'),
+    create: (body: {
+      keywords: string;
+      origin?: 'user' | 'llm';
+      sources?: string[];
+    }): Promise<{ keywords: SearchKeywordDto[]; created: number }> => post('/keywords', body),
+    update: (
+      id: number,
+      body: { enabled?: boolean; sources?: string[]; keyword?: string },
+    ): Promise<SearchKeywordDto> => patch(`/keywords/${id}`, body),
+    remove: (id: number): Promise<{ ok: true }> => del(`/keywords/${id}`),
+    /** Widen the seeds with the local model. */
+    expand: (body: {
+      seeds?: string[];
+      perSeed?: number;
+      replaceGenerated?: boolean;
+    } = {}): Promise<ExpandKeywordsResult> => post('/keywords/expand', body),
+    /** Mirror `settings.search.keywords` into rows after editing them in Settings. */
+    syncSeeds: (): Promise<{ keywords: SearchKeywordDto[] }> => post('/keywords/sync-seeds'),
   },
 
   coverLetters: {

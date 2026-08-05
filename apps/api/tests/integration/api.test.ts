@@ -4,7 +4,12 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import type { ResumeDto, Settings } from '@deedy/shared';
+import type {
+  CompileResumeResult,
+  ResumeDto,
+  ResumeTemplate,
+  Settings,
+} from '@deedy/shared';
 import { loadConfig } from '../../src/config/env.js';
 import { createContainer, type Container } from '../../src/core/container.js';
 import { createServer } from '../../src/api/server.js';
@@ -52,17 +57,25 @@ interface CollectorsBody {
 const UNREACHABLE_LLM_URL = 'http://127.0.0.1:1';
 const DEFAULT_LLM_URL = 'http://localhost:11434';
 
-const RESUME_MARKDOWN = [
-  '# Ada Lovelace',
-  '',
-  '## Experience',
-  '',
-  '- Built the first published algorithm',
-  '',
-  '## Skills',
-  '',
-  '- Analytical engines',
-  '- Mathematics',
+/**
+ * A minimal but real document for the `deedy-resume-openfont` class. Resumes are
+ * LaTeX now, so the fixture has to be something the renderer would actually
+ * accept — a Markdown string would be rejected by the safety check rather than
+ * exercising the route.
+ */
+const RESUME_LATEX = [
+  '\\documentclass{deedy-resume-openfont}',
+  '\\begin{document}',
+  '\\cvmeta{REDACTED NAME}{Staff Engineer}',
+  '\\namesection{REDACTED}{NAME}{Staff Engineer}',
+  '\\section{Experience}',
+  '\\runsubsection{Analytical Engines}',
+  '\\begin{tightemize}',
+  '  \\item Built the first published algorithm.',
+  '\\end{tightemize}',
+  '\\section{Skills}',
+  '\\skillrow{Mathematics}{Analytical engines \\sep Numerical methods}',
+  '\\end{document}',
 ].join('\n');
 
 describe('API integration', () => {
@@ -185,14 +198,14 @@ describe('API integration', () => {
   describe('resumes', () => {
     let resumeId: number;
 
-    it('creates a resume and renders its markdown', async () => {
+    it('creates a resume from LaTeX and renders it', async () => {
       const response = await app.inject({
         method: 'POST',
         url: '/api/resumes',
         payload: {
           name: 'Ada Base Resume',
           targetRole: 'Staff Engineer',
-          markdown: RESUME_MARKDOWN,
+          latex: RESUME_LATEX,
         },
       });
 
@@ -205,9 +218,13 @@ describe('API integration', () => {
       expect(body.version).toBe(1);
       expect(body.isBase).toBe(true);
       expect(body.generatedBy).toBe('user');
-      // The PDF is best-effort: chromium may be absent, in which case the
-      // service logs and leaves pdfPath null. Markdown is always written.
-      expect(body.filePath).toMatch(/\.md$/);
+      expect(body.latex).toBe(RESUME_LATEX);
+      // The PDF is best-effort: a host with no LaTeX engine leaves pdfPath null
+      // and records the failure instead. The .tex source is always written, and
+      // the plain-text mirror is always derived, because the scoring and
+      // cover-letter prompts read prose rather than markup.
+      expect(body.filePath).toMatch(/\.tex$/);
+      expect(body.markdown).toContain('Analytical Engines');
     });
 
     it('lists the created resume', async () => {
@@ -218,11 +235,15 @@ describe('API integration', () => {
       expect(body.resumes.some((resume) => resume.id === resumeId)).toBe(true);
     });
 
-    it('creates a new version when the markdown changes', async () => {
+    it('creates a new version when the LaTeX changes', async () => {
+      const edited = RESUME_LATEX.replace(
+        '\\end{document}',
+        '\\section{Notes}\nDifference engine notes.\n\\end{document}',
+      );
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/resumes/${resumeId}`,
-        payload: { markdown: `${RESUME_MARKDOWN}\n\n- Difference engine notes` },
+        payload: { latex: edited },
       });
 
       expect(response.statusCode).toBe(200);
@@ -230,25 +251,51 @@ describe('API integration', () => {
       expect(body.id).not.toBe(resumeId);
       expect(body.version).toBe(2);
       expect(body.name).toBe('Ada Base Resume');
-      expect(body.markdown).toContain('Difference engine notes');
+      expect(body.latex).toContain('Difference engine notes');
 
-      // The original version is untouched.
+      // The original version is untouched, so earlier applications stay reproducible.
       const original = await app.inject({ method: 'GET', url: `/api/resumes/${resumeId}` });
       expect(original.statusCode).toBe(200);
-      expect(original.json<ResumeDto>().markdown).toBe(RESUME_MARKDOWN);
+      expect(original.json<ResumeDto>().latex).toBe(RESUME_LATEX);
     });
 
-    it('streams the rendered markdown', async () => {
+    it('serves the starter template and its macro contract', async () => {
+      const response = await app.inject({ method: 'GET', url: '/api/resumes/template' });
+
+      expect(response.statusCode).toBe(200);
+      const body = response.json<ResumeTemplate>();
+      expect(body.latex).toContain('\\documentclass{deedy-resume-openfont}');
+      expect(body.macros.length).toBeGreaterThan(0);
+      expect(body.theme.font).toBeTruthy();
+    });
+
+    it('refuses to compile a document that reaches outside itself', async () => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/resumes/compile',
+        payload: { latex: '\\documentclass{deedy-resume-openfont}\\input{/etc/passwd}' },
+      });
+
+      // A rejected document is a normal result, not an error status: the editor
+      // renders `log` verbatim so the user can see exactly what was refused.
+      expect(response.statusCode).toBe(200);
+      const body = response.json<CompileResumeResult>();
+      expect(body.ok).toBe(false);
+      expect(body.previewId).toBeNull();
+      expect(body.log).toMatch(/input/i);
+    });
+
+    it('streams the rendered LaTeX source', async () => {
       const response = await app.inject({
         method: 'GET',
         url: `/api/resumes/${resumeId}/download`,
-        query: { format: 'md' },
+        query: { format: 'tex' },
       });
 
       expect(response.statusCode).toBe(200);
-      expect(response.headers['content-type']).toContain('text/markdown');
+      expect(response.headers['content-type']).toContain('application/x-tex');
       expect(response.headers['content-disposition']).toContain('attachment');
-      expect(response.body).toBe(RESUME_MARKDOWN);
+      expect(response.body).toBe(RESUME_LATEX);
     });
 
     it('404s when downloading a resume that does not exist', async () => {

@@ -86,11 +86,64 @@ export const atsKeywordSchema = z.object({
 export type AtsKeywords = z.infer<typeof atsKeywordSchema>;
 
 export const resumeTailoringSchema = z.object({
-  markdown: z.string().min(50),
+  /** A complete LaTeX document for the deedy-resume-openfont class. */
+  latex: z.string().min(50),
   changeSummary: z.array(z.string()).max(30),
   injectedKeywords: z.array(z.string()).max(60),
 });
 export type ResumeTailoring = z.infer<typeof resumeTailoringSchema>;
+
+/**
+ * Free-form editing. `theme` is a partial patch rather than a whole theme so a
+ * content-only instruction does not silently reset the palette; the caller
+ * merges it over the current theme and validates the result.
+ */
+export const resumeLatexEditSchema = z.object({
+  latex: z.string().min(50),
+  theme: z
+    .object({
+      font: z.string().optional(),
+      density: z.string().optional(),
+      baseFontSize: z.number().optional(),
+      accent: z.string().optional(),
+      primary: z.string().optional(),
+      headings: z.string().optional(),
+      subheadings: z.string().optional(),
+      rule: z.string().optional(),
+      date: z.string().optional(),
+      hmargin: z.number().optional(),
+      vmargin: z.number().optional(),
+    })
+    .partial(),
+  summary: z.array(z.string()).max(30),
+});
+export type ResumeLatexEdit = z.infer<typeof resumeLatexEditSchema>;
+
+/**
+ * Search-term expansion. The model is asked to widen the candidate's own
+ * keywords into the vocabulary job boards actually index — alternate titles,
+ * the stack written the way postings write it, adjacent roles — so one seed
+ * covers the ten searches the user would otherwise type by hand.
+ */
+export const keywordExpansionSchema = z.object({
+  keywords: z
+    .array(
+      z.object({
+        /** The search term itself. Two to four words; this is typed into a search box. */
+        keyword: z.string().min(2).max(80),
+        /** Which of the supplied seeds it was derived from. */
+        seed: z.string().max(80),
+        /** How the term relates to the seed, for the UI to group on. */
+        kind: z
+          .enum(['alternate_title', 'adjacent_role', 'technology', 'seniority', 'domain'])
+          .default('alternate_title'),
+        /** 0-1; the editor sorts on this and low-confidence terms start disabled. */
+        confidence: z.number().min(0).max(1).default(0.5),
+      }),
+    )
+    .max(120),
+});
+export type KeywordExpansion = z.infer<typeof keywordExpansionSchema>;
 
 export const coverLetterSchema = z.object({
   subject: z.string().min(1).max(200),
@@ -116,6 +169,8 @@ export const LLM_OUTPUT_SCHEMAS = {
   company_summary: companySummarySchema,
   ats_keywords: atsKeywordSchema,
   resume_tailoring: resumeTailoringSchema,
+  resume_latex_edit: resumeLatexEditSchema,
+  keyword_expansion: keywordExpansionSchema,
   cover_letter: coverLetterSchema,
   form_answer: formAnswerSchema,
 } as const;

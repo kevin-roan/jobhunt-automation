@@ -92,7 +92,7 @@ export class ApplicationService {
    * that already reached `submitted` is returned untouched, and a partially
    * completed one resumes from its persisted state.
    */
-  async apply(request: ApplyRequest): Promise<ApplyResult> {
+  async apply(request: ApplyRequest, signal?: AbortSignal): Promise<ApplyResult> {
     const job = this.jobs.byId(request.jobId);
     if (!job) throw new NotFoundError('Job', request.jobId);
 
@@ -144,6 +144,7 @@ export class ApplicationService {
         const tailored = await this.resumeService.tailorForJob({
           jobId: job.id,
           baseResumeId: resumeId,
+          signal,
         });
         resumeId = tailored.id;
       } catch (error) {
@@ -172,6 +173,7 @@ export class ApplicationService {
           resumeId,
           applicationId: application.id,
           reuseExisting: true,
+          signal,
         });
         coverLetterId = letter.id;
         coverLetterText = letter.body;

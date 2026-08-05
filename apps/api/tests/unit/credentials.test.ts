@@ -166,12 +166,25 @@ describe('parseCredentialValue: raw Cookie header', () => {
     expect(bundle.cookies).toHaveLength(1);
     expect(bundle.origins).toEqual([]);
     expect(bundle.header).toBeUndefined();
+    // A header paste carries no attributes, so known LinkedIn cookies get the
+    // ones the site actually sets. `li_at` is Secure + HttpOnly + SameSite=None;
+    // a `Lax` li_at is withheld on LinkedIn's cross-site navigations.
     expect(bundle.cookies[0]).toEqual({
       name: 'li_at',
       value: 'AQEDATest123',
       domain: '.linkedin.com',
       path: '/',
       expires: -1,
+      httpOnly: true,
+      secure: true,
+      sameSite: 'None',
+    });
+  });
+
+  it('falls back to secure + Lax for a cookie with no known attributes', () => {
+    const bundle = parseCredentialValue('cookies', 'linkedin', 'lidc=b=OB1');
+
+    expect(bundle.cookies[0]).toMatchObject({
       httpOnly: false,
       secure: true,
       sameSite: 'Lax',

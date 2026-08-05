@@ -84,12 +84,54 @@ Studio, llama.cpp or any other OpenAI-compatible server on the host, skip it and
 | Requirement | Notes |
 | --- | --- |
 | Docker Engine 24+ with Compose v2 | `docker compose version` must work. |
-| ~6 GB free disk for the image | The runtime image installs Chromium **and** Firefox via `npx playwright install --with-deps`. |
+| ~8 GB free disk for the image | Chromium **and** Firefox via `npx playwright install --with-deps`, plus a XeLaTeX subset for resume rendering. |
 | Disk for `/data` | Grows with screenshots and HTML snapshots. Budget 5-20 GB. |
 | A local LLM | Ollama, LM Studio, llama.cpp server, or any OpenAI-compatible endpoint. See [Connecting the local LLM](#connecting-the-local-llm). |
+| Seccomp relaxation for the app service | Already set in `docker-compose.yml`. Required for the LaTeX sandbox — see below. |
 
 Node.js is **not** required on the host for a container deployment; it is only needed for the
 development workflow.
+
+### The LaTeX sandbox and `security_opt`
+
+Resumes are LaTeX documents compiled by a real TeX engine. The LaTeX is written by the local model,
+and `POST /api/resumes/compile` takes no authentication, so the input is attacker-influenced. TeX is
+Turing-complete, which means the pattern denylist in front of the engine is a filter and not a
+boundary — it is bypassable by construction.
+
+The actual containment is `bubblewrap`: the engine runs in a mount namespace holding only the TeX
+distribution and a throwaway work directory. That is what stops a crafted document reading
+`/data/.encryption-key` (the key protecting your stored provider sessions) and returning it inside
+the PDF it produces.
+
+Bubblewrap needs unprivileged user namespaces, which Docker's default seccomp profile blocks, hence:
+
+```yaml
+security_opt:
+  - seccomp:unconfined
+  - apparmor:unconfined
+```
+
+Verify it took effect — the API says which path it is on at startup:
+
+```bash
+docker compose logs app | grep -i sandbox
+# want: "latex compiles run inside a bubblewrap sandbox"
+# not:  a warning that compiles are protected by the denylist alone
+```
+
+If your policy forbids relaxing seccomp, supply a custom profile permitting `unshare` and `clone`
+with the `CLONE_NEW*` flags, or drop the lines and accept that resume compilation is protected by
+the denylist alone. Everything else in the application is unaffected either way.
+
+### What the container cannot do
+
+- **VPN exit-location switching.** Settings → VPN drives NetworkManager on the host, so the
+  `protonvpn`, `nmcli` and `wg_quick` backends do not work from inside the container. Run the app on
+  the host if you need it, or route the container through a tunnel you manage externally.
+- **Indeed from a datacentre address.** Indeed answers HTTP 403 "Request Blocked" to hosting and
+  commodity VPN ranges. This is a network-reputation decision on their side; no collector setting
+  and no exit-country rotation changes it. LinkedIn and the HTTP-only boards are unaffected.
 
 ---
 

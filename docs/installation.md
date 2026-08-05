@@ -43,12 +43,46 @@ Exactly two things, both on the host:
 | Docker Engine  | 24.x (BuildKit is required) | `docker --version`       |
 | Docker Compose | v2 (`docker compose`, not `docker-compose`) | `docker compose version` |
 
-Nothing else is installed on the host. Node.js, npm, SQLite, Chromium, Firefox and the Playwright
-browser builds all live inside the image.
+Nothing else is installed on the host. Node.js, npm, SQLite, Chromium, Firefox, the Playwright
+browser builds, the XeLaTeX engine used for resumes and the `bubblewrap` sandbox that contains it
+all live inside the image.
 
-Rough resource guidance: the image ships both Chromium and Firefox builds, so expect a few GB of
-disk for the image plus whatever your data directory grows to. If you also run the bundled Ollama
-profile, model weights land in a separate volume and are usually the largest thing on disk.
+Rough resource guidance: the image ships both Chromium and Firefox builds plus a TeX subset, so
+expect several GB of disk for the image alone, plus whatever your data directory grows to. If you
+also run the bundled Ollama profile, model weights land in a separate volume and are usually the
+largest thing on disk.
+
+### One Docker setting you should not skip
+
+`docker-compose.yml` sets `security_opt: [seccomp:unconfined, apparmor:unconfined]` on the app
+service. That is there so `bubblewrap` can create the user namespace it sandboxes the TeX engine in.
+
+Resumes are LaTeX, the LaTeX is written by a local model (and the compile endpoint takes no
+authentication), and TeX is a Turing-complete language — so the pattern check in front of the engine
+is a filter, not a security boundary. The namespace is what actually stops a crafted document from
+reading your data directory and returning the credential encryption key inside the PDF.
+
+Docker's default seccomp profile blocks the `unshare` call bubblewrap needs. Without those two
+lines the container still runs, but on the pattern check alone; the API says so loudly at startup.
+If your policy forbids relaxing seccomp, either supply a custom profile permitting `unshare` and
+`clone` with the `CLONE_NEW*` flags, or remove the lines and accept the weaker posture knowingly.
+
+### Running on the host instead of in Docker
+
+A bare-metal install needs a few things the image provides for you:
+
+- **A LaTeX engine.** The resume class uses `fontspec`, so it needs XeLaTeX — `pdflatex` cannot
+  build it. On Debian/Ubuntu: `apt install texlive-xetex texlive-latex-extra
+  texlive-fonts-recommended latexmk`. On Arch: `pacman -S texlive-xetex texlive-latex
+  texlive-latexextra texlive-fontsrecommended texlive-binextra`. A `tectonic` binary on `PATH`
+  works too. Without any engine the API still runs — the `.tex` is saved and every compile reports
+  the engine is missing.
+- **`bubblewrap`**, for the reason above.
+- **Playwright browsers**: `npx playwright install chromium`. LinkedIn and Indeed drive a real
+  browser and fail with a message naming this command when it is absent; the HTTP-only collectors
+  (Greenhouse, Lever, Ashby, Workday, …) are unaffected.
+- Note that `HOST` defaults to `127.0.0.1` outside Docker. The API is unauthenticated, so widen it
+  only deliberately.
 
 ## What gets installed where
 

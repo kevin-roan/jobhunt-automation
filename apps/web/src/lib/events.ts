@@ -22,7 +22,9 @@ const INVALIDATION_MAP: Record<string, string[][]> = {
   'queue.completed': [['queue'], ['analytics']],
   'queue.failed': [['queue']],
   'llm.call': [['llm-calls'], ['analytics']],
-  'collector.run': [['collectors'], ['jobs']],
+  // A run also moves each keyword's jobsFound/lastUsedAt and each source's
+  // counters, and neither of those views polls, so both go stale without this.
+  'collector.run': [['collectors'], ['jobs'], ['keywords'], ['sources']],
   'settings.updated': [['settings']],
 };
 
@@ -31,6 +33,10 @@ const TRACKED_EVENTS = Object.keys(INVALIDATION_MAP);
 /**
  * Subscribes to the server's SSE stream and invalidates the affected queries so
  * the dashboard reflects background work without polling.
+ *
+ * Opens a socket, so it is mounted exactly once (in `App`). Anything that only
+ * wants to *read* the buffer uses `useLiveEventLog` instead — browsers cap
+ * connections per origin, and a second stream would double every invalidation.
  */
 export function useLiveEvents(limit = 60): LiveEvent[] {
   const queryClient = useQueryClient();
@@ -73,4 +79,30 @@ export function useLiveEvents(limit = 60): LiveEvent[] {
   }, [queryClient, limit]);
 
   return events;
+}
+
+const LiveEventsContext = React.createContext<LiveEvent[]>([]);
+
+/**
+ * Owns the single SSE subscription and republishes its buffer, so pages that
+ * display recent activity read from here rather than opening a stream of their own.
+ */
+export function LiveEventsProvider({
+  children,
+  limit,
+}: {
+  children: React.ReactNode;
+  limit?: number;
+}): JSX.Element {
+  const events = useLiveEvents(limit);
+  return React.createElement(LiveEventsContext.Provider, { value: events }, children);
+}
+
+/** Read-only view of the shared buffer — opens no connection of its own. */
+export function useLiveEventLog(limit?: number): LiveEvent[] {
+  const events = React.useContext(LiveEventsContext);
+  return React.useMemo(
+    () => (limit === undefined ? events : events.slice(0, limit)),
+    [events, limit],
+  );
 }

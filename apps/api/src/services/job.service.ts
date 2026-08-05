@@ -24,6 +24,38 @@ export interface CollectionSummary {
 /** Maximum characters of a job description handed to the model in one prompt. */
 const DESCRIPTION_BUDGET = 12000;
 
+/**
+ * Structural views of the keyword and credential stores.
+ *
+ * `KeywordService` imports `describeProfile` from this module, so importing it
+ * back by name would close a cycle. Declaring only the shape this service
+ * actually uses keeps the dependency one-directional.
+ */
+export interface KeywordResolver {
+  /** The enabled search terms this collector should run, already capped. */
+  activeFor(collectorId: string): string[];
+  /** Records that these terms were just searched, and what the run produced. */
+  markSearched(collectorId: string, keywords: string[], jobsFound: number): void;
+}
+
+export interface CookieVault {
+  /** `name=value; …` scoped to the target URL, or undefined when nothing is stored. */
+  cookieHeader(provider: string, url: string): string | undefined;
+}
+
+/**
+ * The slice of the VPN service a collection run needs. Moving the exit buys two
+ * things and only two: a regional index (Indeed serves different listings per
+ * country host and refuses hosts it does not associate with the client) and a
+ * different bucket for the platform's per-IP rate limiting. It does nothing
+ * about browser fingerprinting, so a rotation is worth at most one retry.
+ */
+export interface ExitLocationController {
+  rotateOnBlock(collectorId: string, reason: string): Promise<boolean>;
+  prepareForCollector(collectorId: string): Promise<void>;
+  releaseAfterCollector(collectorId: string): Promise<void>;
+}
+
 export class JobService {
   constructor(
     private readonly jobs: JobRepository,
@@ -33,6 +65,9 @@ export class JobService {
     private readonly browser: BrowserManager,
     private readonly settingsService: SettingsService,
     private readonly llm: LlmService,
+    private readonly keywords: KeywordResolver,
+    private readonly credentials: CookieVault,
+    private readonly vpn: ExitLocationController,
     private readonly logger: Logger,
     private readonly events: EventBus,
   ) {}
@@ -46,11 +81,49 @@ export class JobService {
     const runId = this.collectorRuns.start(collectorId);
     const logger = this.logger.child('collector', { collectorId });
 
+    // Resolved once per run so every keyword/location loop inside the collector
+    // searches the same set, and the run's diagnostics can name it.
+    const keywords = this.keywords.activeFor(collectorId);
+    if (keywords.length === 0) {
+      logger.warn(
+        'no search keywords are enabled for this collector; it will find nothing. Fix: add keywords under Keywords and enable at least one.',
+      );
+    }
+
+    // The VPN is an optimisation, never a precondition: the collector can run
+    // over whatever exit is already up, so a broken tunnel, a missing CLI or a
+    // daemon that is not answering must degrade to "no rotation" and not cost
+    // the user the whole run.
+    const withoutFailingTheRun = async (what: string, act: () => Promise<void>): Promise<void> => {
+      try {
+        await act();
+      } catch (error) {
+        logger.warn(`vpn ${what} failed; continuing on the current exit location`, {
+          error: toErrorMessage(error),
+        });
+      }
+    };
+
     const context: CollectorContext = {
       settings,
       logger,
       http: createHttpClient(),
       browser: this.browser,
+      keywords,
+      cookieHeader: (provider, url) => this.credentials.cookieHeader(provider, url),
+      // Reported false on any failure so the collector stops exactly as it does
+      // today: retrying without having actually moved is pointless traffic.
+      onBlocked: async (reason) => {
+        try {
+          return await this.vpn.rotateOnBlock(collectorId, reason);
+        } catch (error) {
+          logger.warn('vpn rotation failed; treating the exit location as unchanged', {
+            reason,
+            error: toErrorMessage(error),
+          });
+          return false;
+        }
+      },
       limit: settings.search.maxJobsPerCollectorRun,
       signal,
     };
@@ -62,6 +135,8 @@ export class JobService {
     let message: string | null = null;
 
     try {
+      await withoutFailingTheRun('preparation', () => this.vpn.prepareForCollector(collectorId));
+
       const collected = await collector.collect(context);
       found = collected.length;
 
@@ -89,6 +164,12 @@ export class JobService {
         }
       }
 
+      // Attributes the run's total to every term it searched. Imprecise by
+      // design — a platform ranks one result set across all of them — but it is
+      // what makes "which of my keywords are actually earning their place"
+      // answerable on the Keywords page.
+      this.keywords.markSearched(collectorId, keywords, found);
+
       this.collectorRuns.finish(runId, {
         status: 'completed',
         found,
@@ -111,6 +192,10 @@ export class JobService {
       });
       logger.error('collector run failed', { error: message });
       throw error;
+    } finally {
+      // In a finally so a collector that threw still hands the exit back —
+      // otherwise one crashed run pins the tunnel for every later collector.
+      await withoutFailingTheRun('release', () => this.vpn.releaseAfterCollector(collectorId));
     }
 
     return { collectorId, found, inserted, duplicates, errors, message };
@@ -128,8 +213,12 @@ export class JobService {
    * Enriches a job with LLM-derived structure: skills, classification, salary
    * and a summary. Each sub-task is independent, so one failure does not lose
    * the others.
+   *
+   * `signal` reaches every model call and is re-checked between them: this is
+   * up to four sequential generations, so a stop that only landed at the end
+   * would still pay for the rest.
    */
-  async enrich(jobId: number): Promise<void> {
+  async enrich(jobId: number, signal?: AbortSignal): Promise<void> {
     const job = this.jobs.byId(jobId);
     if (!job) throw new NotFoundError('Job', jobId);
 
@@ -143,7 +232,12 @@ export class JobService {
     const logger = this.logger.child('enrich', { jobId });
 
     try {
-      const skills = await this.llm.run('skill_extraction', { variables, jobId, useFastModel: true });
+      const skills = await this.llm.run('skill_extraction', {
+        variables,
+        jobId,
+        useFastModel: true,
+        signal,
+      });
       const all = [
         ...skills.data.hardSkills,
         ...skills.data.tools,
@@ -154,12 +248,14 @@ export class JobService {
     } catch (error) {
       logger.warn('skill extraction failed', { error: toErrorMessage(error) });
     }
+    if (signal?.aborted) return;
 
     try {
       const classification = await this.llm.run('job_classification', {
         variables,
         jobId,
         useFastModel: true,
+        signal,
       });
       this.jobs.updateEnrichment(jobId, {
         remoteType: classification.data.remoteType,
@@ -169,6 +265,7 @@ export class JobService {
     } catch (error) {
       logger.warn('job classification failed', { error: toErrorMessage(error) });
     }
+    if (signal?.aborted) return;
 
     if (job.salaryMin === null && job.salaryMax === null && description) {
       try {
@@ -176,6 +273,7 @@ export class JobService {
           variables,
           jobId,
           useFastModel: true,
+          signal,
         });
         if (salary.data.min !== null || salary.data.max !== null) {
           this.jobs.updateEnrichment(jobId, {
@@ -189,10 +287,11 @@ export class JobService {
         logger.warn('salary extraction failed', { error: toErrorMessage(error) });
       }
     }
+    if (signal?.aborted) return;
 
     if (description) {
       try {
-        const summary = await this.llm.run('job_summary', { variables, jobId });
+        const summary = await this.llm.run('job_summary', { variables, jobId, signal });
         this.jobs.updateEnrichment(jobId, {
           summary: [
             summary.data.headline,
@@ -211,7 +310,11 @@ export class JobService {
   }
 
   /** Scores a job against a resume and persists the full explanation. */
-  async score(jobId: number, resumeIdOverride?: number | null): Promise<{ score: number; recommendation: string }> {
+  async score(
+    jobId: number,
+    resumeIdOverride?: number | null,
+    signal?: AbortSignal,
+  ): Promise<{ score: number; recommendation: string }> {
     const job = this.jobs.byId(jobId);
     if (!job) throw new NotFoundError('Job', jobId);
 
@@ -234,15 +337,18 @@ export class JobService {
       resume: resume ? truncate(resume.markdown, DESCRIPTION_BUDGET) : '(no resume uploaded yet)',
     };
 
-    const scoring = await this.llm.run('application_scoring', { variables, jobId });
+    const scoring = await this.llm.run('application_scoring', { variables, jobId, signal });
 
+    // The score itself is already earned, so it is still persisted below; only
+    // the optional second generation is skipped once a stop lands.
     let interviewProbability: number | null = null;
-    if (resume) {
+    if (resume && !signal?.aborted) {
       try {
         const prediction = await this.llm.run('interview_prediction', {
           variables,
           jobId,
           useFastModel: true,
+          signal,
         });
         interviewProbability = prediction.data.interviewProbability;
       } catch (error) {
@@ -279,7 +385,7 @@ export class JobService {
   }
 
   /** Builds a company profile from the postings already collected for it. */
-  async summarizeCompany(companyId: number): Promise<void> {
+  async summarizeCompany(companyId: number, signal?: AbortSignal): Promise<void> {
     const company = this.jobs.companyById(companyId);
     if (!company) throw new NotFoundError('Company', companyId);
 
@@ -298,6 +404,7 @@ export class JobService {
 
     const summary = await this.llm.run('company_summary', {
       variables: { company: company.name, evidence: truncate(evidence, DESCRIPTION_BUDGET) },
+      signal,
     });
 
     this.jobs.updateCompanySummary(companyId, {

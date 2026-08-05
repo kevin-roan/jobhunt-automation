@@ -10,3 +10,12 @@ data/
 playwright-report/
 test-results/
 apps/api/public/
+
+# LaTeX engine scratch. The .cls, the template and MACROS.md are sources and are
+# committed; everything the engine writes beside them is not.
+.build/
+*.aux
+*.fdb_latexmk
+*.fls
+*.xdv
+*.synctex.gz

@@ -97,10 +97,10 @@ export const workdayCollector: CollectorDefinition = {
       return [];
     }
 
-    const filters = searchFilters(context.settings);
-    const searchTerms = context.settings.search.keywords.length
-      ? context.settings.search.keywords
-      : [''];
+    const filters = searchFilters(context.settings, context.keywords);
+    // The resolved keyword list is what the user manages on the Keywords page;
+    // a blank term is only a deliberate board-wide crawl when there are none.
+    const searchTerms = context.keywords.length > 0 ? context.keywords : [''];
     const results: NormalizedJob[] = [];
 
     for (const board of boards) {

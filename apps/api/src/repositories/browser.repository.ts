@@ -1,4 +1,4 @@
-import { desc, eq } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 import type { BrowserSessionDto, CollectorRunDto } from '@deedy/shared';
 import type { Db } from '../db/client.js';
 import {
@@ -133,6 +133,24 @@ export class CollectorRunRepository {
       .orderBy(desc(collectorRuns.id))
       .limit(limit)
       .all();
+  }
+
+  /**
+   * The most recent run for each collector, in one query — the sources
+   * dashboard needs a row per collector and a query per source would scale
+   * with the registry (built-ins plus plugins).
+   */
+  latestByCollector(): Map<string, CollectorRunRow> {
+    const rows = this.db
+      .select()
+      .from(collectorRuns)
+      .where(
+        // `id` is monotonic, so the highest id per collector is its latest run
+        // without needing a window function.
+        sql`${collectorRuns.id} IN (SELECT max(id) FROM ${collectorRuns} GROUP BY ${collectorRuns.collectorId})`,
+      )
+      .all();
+    return new Map(rows.map((row) => [row.collectorId, row]));
   }
 }
 

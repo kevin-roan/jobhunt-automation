@@ -1,8 +1,24 @@
 import { and, desc, eq, isNull, max, sql } from 'drizzle-orm';
-import type { CoverLetterDto, ResumeDto } from '@deedy/shared';
+import {
+  DEFAULT_RESUME_THEME,
+  resumeThemeSchema,
+  type CoverLetterDto,
+  type ResumeDto,
+  type ResumeTheme,
+} from '@deedy/shared';
 import type { Db } from '../db/client.js';
 import { coverLetters, resumes, type CoverLetterRow, type ResumeRow } from '../db/schema.js';
 import { nowIso } from '../core/utils.js';
+
+/**
+ * The theme column is free-form JSON on disk: rows written before the LaTeX
+ * migration hold `{}`, and a hand-edited row can hold anything at all. Parsing
+ * defensively keeps one bad row from throwing out of the list endpoint.
+ */
+export function toResumeTheme(value: unknown): ResumeTheme {
+  const parsed = resumeThemeSchema.safeParse(value ?? {});
+  return parsed.success ? parsed.data : DEFAULT_RESUME_THEME;
+}
 
 export function toResumeDto(row: ResumeRow): ResumeDto {
   return {
@@ -10,7 +26,13 @@ export function toResumeDto(row: ResumeRow): ResumeDto {
     name: row.name,
     version: row.version,
     targetRole: row.targetRole,
+    latex: row.latex,
+    theme: toResumeTheme(row.theme),
+    templateId: row.templateId,
     markdown: row.markdown,
+    compileLog: row.compileLog,
+    compileOk: row.compileOk,
+    texPath: row.texPath,
     filePath: row.filePath,
     pdfPath: row.pdfPath,
     docxPath: row.docxPath,
@@ -86,7 +108,14 @@ export class ResumeRepository {
   create(input: {
     name: string;
     targetRole?: string | null;
+    latex: string;
+    theme?: ResumeTheme;
+    templateId?: string;
+    /** Plain-text mirror of `latex`; derived by the service, never authored. */
     markdown: string;
+    compileOk?: boolean;
+    compileLog?: string | null;
+    texPath?: string | null;
     isBase: boolean;
     isDefault?: boolean;
     parentId?: number | null;
@@ -116,7 +145,13 @@ export class ResumeRepository {
           name: input.name,
           version,
           targetRole: input.targetRole ?? null,
+          latex: input.latex,
+          theme: input.theme ?? DEFAULT_RESUME_THEME,
+          ...(input.templateId ? { templateId: input.templateId } : {}),
           markdown: input.markdown,
+          compileOk: input.compileOk ?? false,
+          compileLog: input.compileLog ?? null,
+          texPath: input.texPath ?? null,
           isBase: input.isBase,
           isDefault: input.isDefault ?? false,
           parentId: input.parentId ?? null,
@@ -152,6 +187,38 @@ export class ResumeRepository {
     this.db
       .update(resumes)
       .set({ ...paths, updatedAt: nowIso() })
+      .where(eq(resumes.id, id))
+      .run();
+  }
+
+  /**
+   * One write for everything a render produces. The compile log is stored even
+   * when the compile failed, so the editor can show the engine's own error.
+   */
+  setCompileResult(
+    id: number,
+    result: {
+      compileOk: boolean;
+      compileLog?: string | null;
+      texPath?: string | null;
+      pdfPath?: string | null;
+      docxPath?: string | null;
+      filePath?: string | null;
+      markdown?: string;
+    },
+  ): void {
+    this.db
+      .update(resumes)
+      .set({
+        compileOk: result.compileOk,
+        compileLog: result.compileLog ?? null,
+        ...(result.texPath !== undefined ? { texPath: result.texPath } : {}),
+        ...(result.pdfPath !== undefined ? { pdfPath: result.pdfPath } : {}),
+        ...(result.docxPath !== undefined ? { docxPath: result.docxPath } : {}),
+        ...(result.filePath !== undefined ? { filePath: result.filePath } : {}),
+        ...(result.markdown !== undefined ? { markdown: result.markdown } : {}),
+        updatedAt: nowIso(),
+      })
       .where(eq(resumes.id, id))
       .run();
   }

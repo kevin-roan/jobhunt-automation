@@ -18,6 +18,9 @@ services:
       NODE_ENV: development
       DATA_DIR: /data
       LOG_LEVEL: debug
+      # The app defaults to 127.0.0.1; inside a container that would make the
+      # published port unreachable. The container boundary is the port mapping.
+      HOST: 0.0.0.0
       PORT: 8080
       CORS_ORIGINS: http://localhost:5173
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright

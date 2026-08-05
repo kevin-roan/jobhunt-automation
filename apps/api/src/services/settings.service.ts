@@ -51,6 +51,21 @@ function deepMerge<T extends PlainObject>(base: T, patch: PlainObject): T {
 
 const SECRET_PATHS = new Set<string>(SECRET_SETTING_PATHS);
 
+/** The one settings path whose change has to reach the keyword table. */
+const SEARCH_KEYWORDS_PATH = 'search.keywords';
+
+/**
+ * Notified after `search.keywords` is persisted, with the seed list before and
+ * after the write. Declared structurally and registered from the container
+ * rather than imported: the only interested party is KeywordService, which
+ * already depends on SettingsService, so naming it here would close a cycle.
+ */
+export type SearchKeywordsListener = (next: string[], previous: string[]) => void;
+
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
 /**
  * Single source of truth for configuration. Values live in SQLite (secrets
  * encrypted at rest) and are cached in memory for hot-path reads; the cache is
@@ -58,6 +73,8 @@ const SECRET_PATHS = new Set<string>(SECRET_SETTING_PATHS);
  */
 export class SettingsService {
   private cache: Settings | null = null;
+  /** Optional so the service still constructs standalone (tests, migrations, CLI). */
+  private searchKeywordsListener: SearchKeywordsListener | null = null;
 
   constructor(
     private readonly repository: SettingsRepository,
@@ -141,9 +158,30 @@ export class SettingsService {
       const sections = Array.from(new Set(changed.map(([key]) => key.split('.')[0] as string)));
       this.logger.info('settings updated', { sections, keys: changed.map(([key]) => key) });
       this.events.emit('settings.updated', { sections });
+
+      const seeds = changed.find(([key]) => key === SEARCH_KEYWORDS_PATH);
+      if (seeds && this.searchKeywordsListener) {
+        // Saving settings must never fail because a downstream table could not
+        // be reconciled; the sync is repairable from the Keywords screen.
+        try {
+          this.searchKeywordsListener(asStringArray(seeds[1]), asStringArray(flatPrev[SEARCH_KEYWORDS_PATH]));
+        } catch (error) {
+          this.logger.error('search keyword listener failed after settings update', {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
     }
 
     return this.get();
+  }
+
+  /**
+   * Registers the (single) listener fired when `search.keywords` actually
+   * changes. Wired by the container after both services exist.
+   */
+  onSearchKeywordsChanged(listener: SearchKeywordsListener): void {
+    this.searchKeywordsListener = listener;
   }
 
   /** Reads a secret in cleartext. Callers must never log the result. */

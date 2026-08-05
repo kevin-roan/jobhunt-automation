@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import type { Page } from 'playwright';
 import { DEFAULT_SETTINGS, type Settings } from '@deedy/shared';
 
 import { ashbyCollector } from '../../src/collectors/ashby.collector.js';
@@ -9,6 +10,7 @@ import {
   isSignedOutUrl,
   linkedinCollector,
 } from '../../src/collectors/linkedin.collector.js';
+import { indeedCollector } from '../../src/collectors/indeed.collector.js';
 import { recruiteeCollector } from '../../src/collectors/recruitee.collector.js';
 import { smartRecruitersCollector } from '../../src/collectors/smartrecruiters.collector.js';
 import { workableCollector } from '../../src/collectors/workable.collector.js';
@@ -479,6 +481,185 @@ describe('linkedin session detection helpers', () => {
       false,
     );
     expect(isChallengePage('', '')).toBe(false);
+  });
+});
+
+const BLOCK_PAGE_TEXT = 'Request Blocked\nYou have been blocked.\nRay ID: 8f2c0a1b9d';
+const RESULTS_PAGE_TEXT = 'Software Engineer jobs\n1 - 10 of 240 jobs';
+
+/** Long enough that the collector treats it as a description and skips the detail hit. */
+const LONG_SNIPPET = `<p>${'We build payment rails and the platform behind them. '.repeat(12)}</p>`;
+
+const MOSAIC_CARD = {
+  jobkey: 'abc123',
+  title: 'Backend Engineer',
+  company: 'Acme Inc',
+  formattedLocation: 'Berlin',
+  jobDescription: LONG_SNIPPET,
+  pubDate: Date.now(),
+};
+
+interface IndeedPageStub {
+  page: Page;
+  navigations: string[];
+}
+
+/**
+ * Playwright's `evaluate` runs its callback inside a real browser, so a stub
+ * cannot execute it. Each extractor is instead recognised by a distinctive
+ * token in its source and answered with canned data. That couples the stub to
+ * the collector's selectors, which is the price of testing the block/rotate
+ * decision without launching Chromium.
+ */
+function createIndeedPageStub(blockedOn: (visit: number) => boolean): IndeedPageStub {
+  const navigations: string[] = [];
+  let blocked = false;
+
+  const page = {
+    async goto(url: string): Promise<null> {
+      navigations.push(url);
+      blocked = blockedOn(navigations.length);
+      return null;
+    },
+    url(): string {
+      return navigations[navigations.length - 1] ?? 'about:blank';
+    },
+    async waitForSelector(): Promise<null> {
+      return null;
+    },
+    async evaluate(fn: unknown): Promise<unknown> {
+      const source = String(fn);
+      if (source.includes('innerText')) return blocked ? BLOCK_PAGE_TEXT : RESULTS_PAGE_TEXT;
+      if (source.includes('mosaic-provider-jobcards')) return blocked ? [] : [MOSAIC_CARD];
+      if (source.includes('job_seen_beacon')) return [];
+      if (source.includes('jobDescriptionText')) return null;
+      throw new Error(`unexpected page.evaluate in the indeed stub: ${source.slice(0, 80)}`);
+    },
+    async close(): Promise<void> {},
+  };
+
+  return { page: page as unknown as Page, navigations };
+}
+
+describe('indeed collector exit-location rotation', () => {
+  /**
+   * Two blocks in one run. The first is allowed to rotate and retry; the second
+   * must not, or a refusing site gets hammered from every exit the user owns.
+   */
+  it('rotates the exit at most once per run', async () => {
+    vi.useFakeTimers();
+    try {
+      // gotoTolerantOfChallenge retries once on its own, so the first block
+      // costs two navigations; the third is the post-rotation retry that works.
+      const { page, navigations } = createIndeedPageStub((visit) => visit !== 3);
+      const logger = createFakeLogger();
+      const onBlocked = vi.fn(async () => true);
+
+      const context: CollectorContext = {
+        settings: makeSettings({ postedWithinDays: 3650 }),
+        logger,
+        http: createStubHttp({}),
+        browser: {
+          newPage: async (): Promise<Page> => page,
+          saveStorageState: async (): Promise<string | null> => null,
+        } as unknown as BrowserManager,
+        keywords: ['backend engineer'],
+        limit: 50,
+        onBlocked,
+      };
+
+      const pending = indeedCollector.collect(context);
+      // The collector backs off 20s between challenge attempts; drain those
+      // timers instead of spending the wall clock on them.
+      for (let round = 0; round < 12; round += 1) {
+        await vi.advanceTimersByTimeAsync(30000);
+      }
+      const jobs = await pending;
+
+      expect(onBlocked).toHaveBeenCalledTimes(1);
+      expect(onBlocked.mock.calls[0]?.[0]).toContain('indeed');
+      // The retry after the successful rotation is what produced this job.
+      expect(jobs.map((job) => job.externalId)).toEqual(['abc123']);
+      // Two attempts, one rotated retry, then two attempts on the next page.
+      expect(navigations).toHaveLength(5);
+      expect(logger.messages('info')).toContain(
+        'indeed exit location rotated after a block; retrying this search page once',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not retry when the exit location did not actually move', async () => {
+    vi.useFakeTimers();
+    try {
+      const { page, navigations } = createIndeedPageStub(() => true);
+      const logger = createFakeLogger();
+      const onBlocked = vi.fn(async () => false);
+
+      const context: CollectorContext = {
+        settings: makeSettings({ postedWithinDays: 3650 }),
+        logger,
+        http: createStubHttp({}),
+        browser: {
+          newPage: async (): Promise<Page> => page,
+          saveStorageState: async (): Promise<string | null> => null,
+        } as unknown as BrowserManager,
+        keywords: ['backend engineer'],
+        limit: 50,
+        onBlocked,
+      };
+
+      const pending = indeedCollector.collect(context);
+      for (let round = 0; round < 12; round += 1) {
+        await vi.advanceTimersByTimeAsync(30000);
+      }
+      const jobs = await pending;
+
+      expect(onBlocked).toHaveBeenCalledTimes(1);
+      expect(jobs).toEqual([]);
+      // Only the original two attempts: a rotation that did not move is not a
+      // reason to ask the same server again.
+      expect(navigations).toHaveLength(2);
+      expect(logger.messages('warn')).toContain(
+        'indeed is blocking this run and the exit location did not move; not retrying',
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never calls onBlocked when nothing blocks the run', async () => {
+    vi.useFakeTimers();
+    try {
+      const { page } = createIndeedPageStub(() => false);
+      const logger = createFakeLogger();
+      const onBlocked = vi.fn(async () => true);
+
+      const context: CollectorContext = {
+        settings: makeSettings({ postedWithinDays: 3650 }),
+        logger,
+        http: createStubHttp({}),
+        browser: {
+          newPage: async (): Promise<Page> => page,
+          saveStorageState: async (): Promise<string | null> => null,
+        } as unknown as BrowserManager,
+        keywords: ['backend engineer'],
+        limit: 1,
+        onBlocked,
+      };
+
+      const pending = indeedCollector.collect(context);
+      for (let round = 0; round < 12; round += 1) {
+        await vi.advanceTimersByTimeAsync(30000);
+      }
+      const jobs = await pending;
+
+      expect(onBlocked).not.toHaveBeenCalled();
+      expect(jobs).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

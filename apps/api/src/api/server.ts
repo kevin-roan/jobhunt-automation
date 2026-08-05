@@ -56,6 +56,14 @@ export async function createServer(container: Container): Promise<FastifyInstanc
         { name: 'cover-letters', description: 'Generated cover letters' },
         { name: 'queue', description: 'Persistent background queue' },
         { name: 'collectors', description: 'Job sources and plugin registry' },
+        {
+          name: 'keywords',
+          description: 'Search terms typed into each platform, seeded by you and widened locally',
+        },
+        {
+          name: 'vpn',
+          description: 'Exit location, which decides the regional job index the collectors search',
+        },
         { name: 'browser', description: 'Persistent browser profiles and sessions' },
         { name: 'observability', description: 'Logs, LLM activity and prompt templates' },
         { name: 'analytics', description: 'Aggregated metrics' },

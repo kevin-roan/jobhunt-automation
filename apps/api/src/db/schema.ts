@@ -124,7 +124,18 @@ export const resumes = sqliteTable(
     name: text('name').notNull(),
     version: integer('version').notNull().default(1),
     targetRole: text('target_role'),
+    /** Source of truth: a LaTeX document for the deedy-resume-openfont class. */
+    latex: text('latex').notNull().default(''),
+    theme: text('theme', { mode: 'json' })
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default(sql`'{}'`),
+    templateId: text('template_id').notNull().default('deedy-resume-openfont'),
+    /** Plain-text mirror of `latex`, regenerated on every render. */
     markdown: text('markdown').notNull(),
+    compileLog: text('compile_log'),
+    compileOk: integer('compile_ok', { mode: 'boolean' }).notNull().default(false),
+    texPath: text('tex_path'),
     filePath: text('file_path'),
     pdfPath: text('pdf_path'),
     docxPath: text('docx_path'),
@@ -504,12 +515,52 @@ export const remoteCommands = sqliteTable(
   (t) => [uniqueIndex('remote_commands_remote_idx').on(t.remoteId)],
 );
 
+/**
+ * Every term a collector will type into a search box. User seeds and the local
+ * model's expansions of them share one table so the editor can enable, disable
+ * and scope each one individually.
+ *
+ * MIGRATION-OWNED INDEX — do not regenerate this table with drizzle-kit.
+ * De-duplication depends on the UNIQUE expression index
+ *   search_keywords_unique_idx ON search_keywords (normalized, COALESCE(seed, ''))
+ * declared in migrations/0004_search_keywords.sql. Drizzle cannot express a
+ * COALESCE index, so it is intentionally absent below and `drizzle-kit
+ * generate`/`push` will emit a DROP for it. Losing it does not fail loudly: it
+ * turns every `onConflictDoNothing` in KeywordRepository into an unconditional
+ * insert, and the keyword list quietly fills with duplicates. If this table
+ * ever has to change, hand-write the migration and re-create that index.
+ */
+export const searchKeywords = sqliteTable(
+  'search_keywords',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    keyword: text('keyword').notNull(),
+    /** Lower-cased and whitespace-collapsed; used only for de-duplication. */
+    normalized: text('normalized').notNull(),
+    /** The user term this was expanded from; null for a user term itself. */
+    seed: text('seed'),
+    origin: text('origin').notNull().default('user'),
+    kind: text('kind').notNull().default('alternate_title'),
+    confidence: real('confidence'),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+    /** Collector ids this term is limited to; empty means every collector. */
+    sources: text('sources', { mode: 'json' }).$type<string[]>().notNull().default(sql`'[]'`),
+    lastUsedAt: text('last_used_at'),
+    jobsFound: integer('jobs_found').notNull().default(0),
+    createdAt: text('created_at').notNull().default(now),
+    updatedAt: text('updated_at').notNull().default(now),
+  },
+  (t) => [index('search_keywords_enabled_idx').on(t.enabled, t.origin)],
+);
+
 export const syncState = sqliteTable('sync_state', {
   key: text('key').primaryKey(),
   value: text('value').notNull(),
   updatedAt: text('updated_at').notNull().default(now),
 });
 
+export type SearchKeywordRow = typeof searchKeywords.$inferSelect;
+export type NewSearchKeywordRow = typeof searchKeywords.$inferInsert;
 export type ProviderCredentialRow = typeof providerCredentials.$inferSelect;
 export type NotificationRow = typeof notifications.$inferSelect;
 export type SyncOutboxRow = typeof syncOutbox.$inferSelect;

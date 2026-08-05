@@ -5,11 +5,14 @@ import {
   detectEmploymentType,
   detectExperienceLevel,
   detectRemoteType,
+  matchesAnyKeyword,
   matchesSearchFilters,
   parseSalary,
+  searchFilters,
   toIsoDate,
   type SearchFilters,
 } from '../../src/collectors/normalize.js';
+import { DEFAULT_SETTINGS, type Settings } from '@deedy/shared';
 import { parseWorkdayBoard } from '../../src/collectors/workday.collector.js';
 
 const DAY_MS = 86400000;
@@ -244,6 +247,77 @@ describe('matchesSearchFilters', () => {
     expect(
       matchesSearchFilters({ title: 'Backend Engineer', company: 'Acme' }, filters({ keywords: ['backend'] })),
     ).toBe(true);
+  });
+});
+
+describe('matchesAnyKeyword word boundaries', () => {
+  it('matches a punctuation-leading term mid-word, so ".net" finds "ASP.NET"', () => {
+    expect(matchesAnyKeyword('.NET engineer', ['.net'])).toBe(true);
+    expect(matchesAnyKeyword('ASP.NET Core Developer', ['.net'])).toBe(true);
+  });
+
+  it('still refuses matches inside a longer word for alphanumeric terms', () => {
+    expect(matchesAnyKeyword('reactive systems', ['react'])).toBe(false);
+    expect(matchesAnyKeyword('Golang developer', ['go'])).toBe(false);
+    expect(matchesAnyKeyword('nodejs developer', ['node.js'])).toBe(false);
+    expect(matchesAnyKeyword('Node.js developer', ['node.js'])).toBe(true);
+  });
+
+  it('handles punctuation-trailing terms such as "c++"', () => {
+    expect(matchesAnyKeyword('Senior C++ Engineer', ['c++'])).toBe(true);
+    expect(matchesAnyKeyword('Senior C Engineer', ['c++'])).toBe(false);
+  });
+});
+
+describe('matchesSearchFilters exclusions', () => {
+  const job = { title: 'Senior Backend Engineer', company: 'Acme' };
+
+  it('applies word boundaries to exclusions instead of a raw substring test', () => {
+    // "go" must not drop a posting merely because it says "algorithm".
+    expect(
+      matchesSearchFilters(
+        { ...job, description: 'Strong algorithm design skills.' },
+        filters({ excludedKeywords: ['go'] }),
+      ),
+    ).toBe(true);
+    expect(
+      matchesSearchFilters(
+        { ...job, description: 'Go and Rust services.' },
+        filters({ excludedKeywords: ['go'] }),
+      ),
+    ).toBe(false);
+  });
+
+  it('does not let a single-letter exclusion drop everything', () => {
+    expect(
+      matchesSearchFilters(
+        { ...job, description: 'Python and TypeScript.' },
+        filters({ excludedKeywords: ['c'] }),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps every job when no exclusions are configured', () => {
+    expect(matchesSearchFilters(job, filters({ excludedKeywords: [] }))).toBe(true);
+  });
+});
+
+describe('searchFilters keyword resolution', () => {
+  const settings: Settings = {
+    ...DEFAULT_SETTINGS,
+    search: { ...DEFAULT_SETTINGS.search, keywords: ['seed term'] },
+  };
+
+  it('falls back to the settings seed list only when the argument is omitted', () => {
+    expect(searchFilters(settings).keywords).toEqual(['seed term']);
+  });
+
+  it('honours an intentionally empty resolved list rather than masking it', () => {
+    expect(searchFilters(settings, []).keywords).toEqual([]);
+  });
+
+  it('uses the resolved list when one is supplied', () => {
+    expect(searchFilters(settings, ['resolved']).keywords).toEqual(['resolved']);
   });
 });
 

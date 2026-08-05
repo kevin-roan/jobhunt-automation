@@ -137,6 +137,7 @@ export const LLM_TASKS = [
   'skill_extraction',
   'job_classification',
   'resume_tailoring',
+  'resume_latex_edit',
   'cover_letter',
   'ats_keywords',
   'application_scoring',
@@ -144,10 +145,102 @@ export const LLM_TASKS = [
   'job_summary',
   'company_summary',
   'salary_extraction',
+  'keyword_expansion',
   'form_answer',
 ] as const;
 export const llmTaskSchema = z.enum(LLM_TASKS);
 export type LlmTask = z.infer<typeof llmTaskSchema>;
+
+/**
+ * Who put a search keyword in the list. `user` keywords are the seeds the
+ * candidate typed and are never rewritten; `llm` keywords are expansions the
+ * local model generated around a seed and can be regenerated at will.
+ */
+export const KEYWORD_ORIGINS = ['user', 'llm'] as const;
+export const keywordOriginSchema = z.enum(KEYWORD_ORIGINS);
+export type KeywordOrigin = z.infer<typeof keywordOriginSchema>;
+
+/**
+ * The independently startable/stoppable halves of the pipeline. Inference is
+ * by far the most expensive thing this system does, so every stage that calls
+ * the model is its own switch: the user can keep collecting while the LLM is
+ * completely idle.
+ */
+export const PIPELINE_STAGES = [
+  'collect',
+  'enrich',
+  'score',
+  'tailor',
+  'cover_letter',
+  'apply',
+] as const;
+export const pipelineStageSchema = z.enum(PIPELINE_STAGES);
+export type PipelineStage = z.infer<typeof pipelineStageSchema>;
+
+/**
+ * The `PipelineSettings` key holding a given stage's switch. Only
+ * `cover_letter` differs: settings spell it in camelCase, stage ids in snake.
+ */
+export type PipelineStageSettingKey<S extends PipelineStage> = S extends 'cover_letter'
+  ? 'coverLetter'
+  : S;
+
+/**
+ * Stage id -> settings key. The one place the two vocabularies meet; the worker
+ * and the dashboard both read it so they cannot drift apart. The mapped type
+ * pins every entry to its own literal, so a copy/paste slip such as
+ * `cover_letter: 'apply'` is a compile error rather than a silent mis-switch.
+ */
+export const STAGE_SETTING_KEY: { [S in PipelineStage]: PipelineStageSettingKey<S> } = {
+  collect: 'collect',
+  enrich: 'enrich',
+  score: 'score',
+  tailor: 'tailor',
+  cover_letter: 'coverLetter',
+  apply: 'apply',
+};
+
+/** Which pipeline stage each unit of background work belongs to. */
+export const QUEUE_TASK_STAGE: Record<string, PipelineStage> = {
+  'collect.jobs': 'collect',
+  'job.enrich': 'enrich',
+  'job.score': 'score',
+  'resume.tailor': 'tailor',
+  'cover_letter.generate': 'cover_letter',
+  'application.apply': 'apply',
+};
+
+/** The stages that spend inference. Stopping these is what frees the machine. */
+export const LLM_PIPELINE_STAGES: PipelineStage[] = [
+  'enrich',
+  'score',
+  'tailor',
+  'cover_letter',
+];
+
+/**
+ * Font presets the resume class can install. Every one of these ships inside
+ * TeX Live, so switching typeface never requires a download.
+ */
+export const RESUME_FONTS = ['raleway', 'sourcesans', 'fira', 'garamond', 'latinmodern'] as const;
+export const resumeFontSchema = z.enum(RESUME_FONTS);
+export type ResumeFont = z.infer<typeof resumeFontSchema>;
+
+/** How tightly the resume packs vertically. Drives every gap in the class. */
+export const RESUME_DENSITIES = ['compact', 'normal', 'relaxed'] as const;
+export const resumeDensitySchema = z.enum(RESUME_DENSITIES);
+export type ResumeDensity = z.infer<typeof resumeDensitySchema>;
+
+/**
+ * How the host's VPN is driven. Proton ships no scriptable CLI on Linux any
+ * more — v4 is a GTK app over `proton-vpn-api-core` — so `protonvpn` means the
+ * bundled Python helper that talks to that library. The other backends exist
+ * because a tunnel is a tunnel: anyone already managing one through
+ * NetworkManager, wg-quick or a script of their own should not have to switch.
+ */
+export const VPN_BACKENDS = ['none', 'protonvpn', 'nmcli', 'wg_quick', 'command'] as const;
+export const vpnBackendSchema = z.enum(VPN_BACKENDS);
+export type VpnBackend = z.infer<typeof vpnBackendSchema>;
 
 export const BROWSER_ENGINES = ['chromium', 'chrome', 'firefox'] as const;
 export const browserEngineSchema = z.enum(BROWSER_ENGINES);

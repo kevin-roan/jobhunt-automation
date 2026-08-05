@@ -77,7 +77,7 @@ export const smartRecruitersCollector: CollectorDefinition = {
       return [];
     }
 
-    const filters = searchFilters(context.settings);
+    const filters = searchFilters(context.settings, context.keywords);
     const results: NormalizedJob[] = [];
 
     for (const board of boards) {

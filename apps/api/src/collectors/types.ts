@@ -17,6 +17,28 @@ export interface CollectorContext {
   browser: BrowserManager;
   /** Hard cap on jobs to return in this run. */
   limit: number;
+  /**
+   * The resolved, enabled search terms for THIS collector, already capped by
+   * settings.search.keywordExpansion.maxActiveKeywords. The caller falls back
+   * to settings.search.keywords when no keyword rows exist, so a collector can
+   * treat this as the single source of truth and never read settings.search.keywords.
+   */
+  keywords: string[];
+  /**
+   * `name=value; name=value` for the target URL from the credential vault, or
+   * undefined when nothing is stored. Lets HTTP-only collectors reuse a pasted
+   * session without depending on the credential service directly.
+   */
+  cookieHeader?: (provider: string, url: string) => string | undefined;
+  /**
+   * Reports that the platform blocked or challenged this run. Returns true when
+   * the exit location actually moved, which is the only case where retrying is
+   * worth anything. A no-op unless the user enabled VPN rotation.
+   *
+   * Call it at most once per run: a collector that keeps rotating and retrying
+   * against a site that is refusing it is abuse, not resilience.
+   */
+  onBlocked?: (reason: string) => Promise<boolean>;
   signal?: AbortSignal;
 }
 

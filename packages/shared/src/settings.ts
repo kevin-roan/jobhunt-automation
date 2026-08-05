@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   browserEngineSchema,
+  vpnBackendSchema,
   employmentTypeSchema,
   experienceLevelSchema,
   llmProviderSchema,
@@ -33,6 +34,59 @@ export const llmSettingsSchema = z.object({
 });
 export type LlmSettings = z.infer<typeof llmSettingsSchema>;
 
+/**
+ * Exit-location control.
+ *
+ * Two honest reasons this exists. First, job boards are regional: Indeed serves
+ * a different result set per country, so searching "jobs in Berlin" from an
+ * Indian exit returns the wrong index. Second, a shared or datacentre IP gets
+ * rate-limited quickly, and moving exits spreads a slow crawl out.
+ *
+ * It is NOT a way to defeat a determined anti-bot system — those fingerprint far
+ * more than the IP — and rotating harder is not a substitute for crawling
+ * politely. Every rotation is rate-limited by `minRotationSeconds` for that
+ * reason.
+ */
+export const vpnSettingsSchema = z.object({
+  enabled: z.boolean().default(false),
+  backend: vpnBackendSchema.default('none'),
+  /**
+   * ISO 3166-1 alpha-2 exit countries, tried in order. Empty means "let the
+   * backend pick", which for Proton is its own fastest-server choice.
+   */
+  countries: z.array(z.string().length(2)).default([]),
+  /** Reconnect to the next country when a collector reports a block or challenge. */
+  rotateOnBlock: z.boolean().default(false),
+  /** Floor between rotations, so a blocked run cannot thrash the tunnel. */
+  minRotationSeconds: z.number().int().min(30).max(86400).default(300),
+  /** Bring the tunnel up before a collector run that needs it. */
+  connectBeforeCollect: z.boolean().default(false),
+  /** Drop the tunnel again once the run finishes. */
+  disconnectAfterCollect: z.boolean().default(false),
+  /** Only these collectors trigger VPN handling; empty means every collector. */
+  collectors: z.array(z.string()).default([]),
+  /** Seconds to wait for the tunnel to report connected before giving up. */
+  connectTimeoutSeconds: z.number().int().min(5).max(300).default(60),
+  /**
+   * Command templates for `backend: 'command'`. `{{country}}` is substituted.
+   * Split on whitespace and executed directly — never through a shell — so a
+   * template can neither pipe nor chain.
+   */
+  connectCommand: z.string().default(''),
+  disconnectCommand: z.string().default(''),
+  statusCommand: z.string().default(''),
+  /** NetworkManager connection name per country, for `backend: 'nmcli'`. */
+  nmcliConnectionPrefix: z.string().default(''),
+  /**
+   * Confirm the exit actually moved after connecting. This contacts one
+   * IP-echo endpoint — the only outbound call this feature makes — so it is off
+   * by default and the endpoint is yours to choose.
+   */
+  verifyExitIp: z.boolean().default(false),
+  exitIpEndpoint: z.string().default('https://api.protonvpn.ch/vpn/location'),
+});
+export type VpnSettings = z.infer<typeof vpnSettingsSchema>;
+
 export const browserSettingsSchema = z.object({
   engine: browserEngineSchema.default('chromium'),
   headless: z.boolean().default(true),
@@ -53,9 +107,32 @@ export const browserSettingsSchema = z.object({
 });
 export type BrowserSettings = z.infer<typeof browserSettingsSchema>;
 
+/**
+ * How aggressively the local model widens the candidate's own search terms.
+ * Expansion runs on demand and its output is stored as editable rows, so the
+ * user always sees — and can veto — every term that is actually searched.
+ */
+export const keywordExpansionSettingsSchema = z.object({
+  enabled: z.boolean().default(true),
+  /** Extra terms generated per seed keyword. */
+  perSeed: z.number().int().min(1).max(25).default(6),
+  /** Terms below this confidence are stored but start disabled. */
+  minConfidence: z.number().min(0).max(1).default(0.45),
+  /** Hard cap on how many terms any one collector run will search. */
+  maxActiveKeywords: z.number().int().min(1).max(200).default(30),
+  /** Re-expand automatically whenever the seed list changes. */
+  autoExpandOnSeedChange: z.boolean().default(false),
+});
+export type KeywordExpansionSettings = z.infer<typeof keywordExpansionSettingsSchema>;
+
 export const searchSettingsSchema = z.object({
+  /**
+   * The candidate's own seed terms. These are never rewritten; the expanded
+   * terms the collectors actually search live in the `search_keywords` table.
+   */
   keywords: z.array(z.string().min(1)).default([]),
   excludedKeywords: z.array(z.string().min(1)).default([]),
+  keywordExpansion: keywordExpansionSettingsSchema.default({}),
   locations: z.array(z.string().min(1)).default([]),
   remotePreference: z.array(remoteTypeSchema).default(['remote']),
   employmentTypes: z.array(employmentTypeSchema).default(['full_time']),
@@ -97,6 +174,27 @@ export const queueSettingsSchema = z.object({
   paused: z.boolean().default(false),
 });
 export type QueueSettings = z.infer<typeof queueSettingsSchema>;
+
+/**
+ * Per-stage master switches, owned by the dashboard's start/stop controls.
+ *
+ * Local inference saturates a machine: one 14B model scoring a backlog will
+ * take every core it can get. Each stage that calls the model is therefore
+ * independently stoppable, and stopping one both blocks new work from being
+ * claimed and aborts whatever that stage already has in flight. The flags are
+ * persisted, so a stopped pipeline stays stopped across a restart.
+ */
+export const pipelineSettingsSchema = z.object({
+  /** Master switch. Off means nothing is claimed from the queue at all. */
+  enabled: z.boolean().default(true),
+  collect: z.boolean().default(true),
+  enrich: z.boolean().default(true),
+  score: z.boolean().default(true),
+  tailor: z.boolean().default(true),
+  coverLetter: z.boolean().default(true),
+  apply: z.boolean().default(true),
+});
+export type PipelineSettings = z.infer<typeof pipelineSettingsSchema>;
 
 export const schedulerSettingsSchema = z.object({
   enabled: z.boolean().default(true),
@@ -179,6 +277,8 @@ export const settingsSchema = z.object({
   application: applicationSettingsSchema,
   queue: queueSettingsSchema,
   scheduler: schedulerSettingsSchema,
+  pipeline: pipelineSettingsSchema,
+  vpn: vpnSettingsSchema,
   notifications: notificationSettingsSchema,
   profile: profileSettingsSchema,
   sync: syncSettingsSchema,
@@ -193,6 +293,8 @@ export const settingsPatchSchema = z
     application: applicationSettingsSchema.partial(),
     queue: queueSettingsSchema.partial(),
     scheduler: schedulerSettingsSchema.partial(),
+    pipeline: pipelineSettingsSchema.partial(),
+    vpn: vpnSettingsSchema.partial(),
     notifications: notificationSettingsSchema.partial(),
     profile: profileSettingsSchema.partial(),
     sync: syncSettingsSchema.partial(),
@@ -214,6 +316,8 @@ export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({
   application: {},
   queue: {},
   scheduler: {},
+  pipeline: {},
+  vpn: {},
   notifications: {},
   profile: {},
   sync: {},

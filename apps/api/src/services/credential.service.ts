@@ -50,6 +50,71 @@ const PROVIDER_DOMAINS: Record<string, string> = {
   indeed: '.indeed.com',
 };
 
+/**
+ * Cookies a provider needs before its collector can see signed-in content.
+ * Used to tell the user precisely what is missing rather than "session invalid".
+ */
+export const REQUIRED_COOKIES: Record<string, string[]> = {
+  linkedin: ['li_at'],
+  indeed: ['CTK'],
+};
+
+/** The attributes a site actually sets, for cookies pasted without any. */
+interface CookieAttributes {
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: SameSite;
+}
+
+/**
+ * A `Cookie:` header carries names and values only - every attribute is lost.
+ * Guessing wrong is not cosmetic: Playwright's `addCookies` rejects
+ * `sameSite: 'None'` without `secure: true`, and a `Lax` cookie is withheld on
+ * the cross-site navigations LinkedIn performs between www/, static/ and the
+ * authwall, so a correctly pasted `li_at` still reads as signed out. This table
+ * restores the attributes the site itself sends; unknown cookies fall back to
+ * the conservative `secure + Lax` default below.
+ */
+const KNOWN_COOKIE_ATTRIBUTES: Record<string, Record<string, CookieAttributes>> = {
+  linkedin: {
+    // The session token itself: Secure, HttpOnly, SameSite=None.
+    li_at: { httpOnly: true, secure: true, sameSite: 'None' },
+    // Readable by page scripts - it seeds the CSRF token header.
+    JSESSIONID: { httpOnly: false, secure: true, sameSite: 'None' },
+    liap: { httpOnly: true, secure: true, sameSite: 'None' },
+    li_rm: { httpOnly: true, secure: true, sameSite: 'None' },
+    bcookie: { httpOnly: false, secure: true, sameSite: 'None' },
+    bscookie: { httpOnly: true, secure: true, sameSite: 'None' },
+  },
+  indeed: {
+    CTK: { httpOnly: false, secure: true, sameSite: 'Lax' },
+    SHOE: { httpOnly: false, secure: true, sameSite: 'Lax' },
+    INDEED_CSRF_TOKEN: { httpOnly: false, secure: true, sameSite: 'Lax' },
+  },
+};
+
+/** What an unrecognised header-pasted cookie gets: safe on HTTPS, same-site only. */
+const DEFAULT_COOKIE_ATTRIBUTES: CookieAttributes = {
+  httpOnly: false,
+  secure: true,
+  sameSite: 'Lax',
+};
+
+function attributesFor(provider: string, name: string): CookieAttributes {
+  const table = KNOWN_COOKIE_ATTRIBUTES[provider.trim().toLowerCase()];
+  return table?.[name] ?? DEFAULT_COOKIE_ATTRIBUTES;
+}
+
+/** Cookie names a provider requires that the bundle does not carry. */
+function missingFrom(provider: string, cookies: PlaywrightCookie[]): string[] {
+  const required = REQUIRED_COOKIES[provider.trim().toLowerCase()] ?? [];
+  const present = new Set(cookies.map((cookie) => cookie.name));
+  return required.filter((name) => !present.has(name));
+}
+
+/** Debug sink for parse-time observations that need a logger the parser lacks. */
+export type ParseDebug = (message: string, context: Record<string, unknown>) => void;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -67,6 +132,11 @@ function toSameSite(value: unknown): SameSite {
     case 'none':
     case 'no_restriction':
       return 'None';
+    // Chrome's own export writes "unspecified" for a cookie with no attribute;
+    // the browser then treats it as Lax, so we must too.
+    case 'unspecified':
+    case 'lax':
+      return 'Lax';
     default:
       return 'Lax';
   }
@@ -95,20 +165,49 @@ function cookieDomain(raw: unknown, hostOnly: unknown, provider: string): string
   return value;
 }
 
-function normalizeCookieObject(entry: unknown, provider: string): PlaywrightCookie | null {
+/**
+ * A cookie scoped to `www.linkedin.com` is NOT sent to `linkedin.com`, so a
+ * paste that looks complete can still authenticate nothing. We keep the domain
+ * the user exported - rewriting it would be a security decision we are not
+ * entitled to make - but we say so, because it is a leading cause of
+ * "my cookies don't work".
+ */
+function isStrictSubdomain(domain: string, registrable: string): boolean {
+  const bare = (domain.startsWith('.') ? domain.slice(1) : domain).toLowerCase();
+  const root = (registrable.startsWith('.') ? registrable.slice(1) : registrable).toLowerCase();
+  return bare !== root && bare.endsWith(`.${root}`);
+}
+
+function normalizeCookieObject(
+  entry: unknown,
+  provider: string,
+  debug?: ParseDebug,
+): PlaywrightCookie | null {
   if (!isRecord(entry)) return null;
-  const name = entry.name ?? entry.key;
-  const value = entry.value;
+  // Some extensions (and .NET/Java exporters) capitalise the keys.
+  const name = entry.name ?? entry.key ?? entry.Name;
+  const value = entry.value ?? entry.Value;
   if (typeof name !== 'string' || name.trim().length === 0) return null;
   if (typeof value !== 'string') return null;
 
   const session = entry.session === true;
   const expires = session ? -1 : toUnixSeconds(entry.expirationDate ?? entry.expires ?? entry.expiry);
+  const domain = cookieDomain(entry.domain, entry.hostOnly, provider);
+
+  const registrable = PROVIDER_DOMAINS[provider.trim().toLowerCase()];
+  if (debug && registrable && isStrictSubdomain(domain, registrable)) {
+    debug('cookie is scoped to a subdomain of the provider domain', {
+      provider,
+      cookie: name.trim(),
+      domain,
+      registrable,
+    });
+  }
 
   return {
     name: name.trim(),
     value,
-    domain: cookieDomain(entry.domain, entry.hostOnly, provider),
+    domain,
     path: typeof entry.path === 'string' && entry.path.length > 0 ? entry.path : '/',
     expires,
     httpOnly: entry.httpOnly === true,
@@ -134,10 +233,12 @@ function parseCookieHeader(raw: string, provider: string): PlaywrightCookie[] {
       value: value.replace(/^"|"$/g, ''),
       domain: defaultDomain(provider),
       path: '/',
+      // A header paste carries no expiry, so every cookie is treated as a
+      // session cookie. That is correct - we genuinely do not know when it
+      // lapses - but it means `save()` derives no `expiresAt` and the expiry
+      // sweep can never demote the row; only a live probe can.
       expires: -1,
-      httpOnly: false,
-      secure: true,
-      sameSite: 'Lax',
+      ...attributesFor(provider, name),
     });
   }
   return cookies;
@@ -188,6 +289,7 @@ export function parseCredentialValue(
   kind: CredentialKind,
   provider: string,
   raw: string,
+  debug?: ParseDebug,
 ): CredentialBundle {
   const trimmed = raw.trim();
   if (trimmed.length === 0) {
@@ -204,7 +306,7 @@ export function parseCredentialValue(
   if (Array.isArray(parsed)) {
     const cookies = dedupe(
       parsed
-        .map((entry) => normalizeCookieObject(entry, provider))
+        .map((entry) => normalizeCookieObject(entry, provider, debug))
         .filter((cookie): cookie is PlaywrightCookie => cookie !== null),
     );
     if (cookies.length === 0) {
@@ -218,7 +320,7 @@ export function parseCredentialValue(
   if (isRecord(parsed)) {
     const cookies = dedupe(
       (Array.isArray(parsed.cookies) ? parsed.cookies : [])
-        .map((entry) => normalizeCookieObject(entry, provider))
+        .map((entry) => normalizeCookieObject(entry, provider, debug))
         .filter((cookie): cookie is PlaywrightCookie => cookie !== null),
     );
     const origins = parseOrigins(parsed.origins);
@@ -293,14 +395,32 @@ export class CredentialService {
     return row ? toProviderCredentialDto(row) : undefined;
   }
 
+  /**
+   * Required cookie names the stored bundle does not carry, so the UI can name
+   * the missing cookie instead of saying "session invalid".
+   */
+  missingRequired(provider: string): string[] {
+    const bundle = this.load(provider);
+    if (!bundle) return REQUIRED_COOKIES[provider.trim().toLowerCase()] ?? [];
+    return missingFrom(provider, bundle.cookies);
+  }
+
   save(input: SaveCredentialInput): ProviderCredentialDto {
     const provider = input.provider.trim().toLowerCase();
-    const bundle = parseCredentialValue(input.kind, provider, input.value);
+    const bundle = parseCredentialValue(input.kind, provider, input.value, (message, context) =>
+      this.logger.debug(message, context),
+    );
 
     const domains = Array.from(new Set(bundle.cookies.map((cookie) => cookie.domain))).sort();
+    // Session cookies carry `expires: -1`; a header paste has nothing else, so
+    // `expiresAt` stays null and the expiry sweep cannot demote the row. That is
+    // intentional - the `note` below tells the user we could not date it.
     const expiries = bundle.cookies.map((cookie) => cookie.expires).filter((value) => value > 0);
     const expiresAt =
       expiries.length > 0 ? new Date(Math.min(...expiries) * 1000).toISOString() : null;
+
+    const missing = missingFrom(provider, bundle.cookies);
+    const note = input.note ?? this.derivedNote(provider, bundle, missing, expiresAt);
 
     const row = this.repository.upsert({
       provider,
@@ -311,7 +431,7 @@ export class CredentialService {
       cookieCount: bundle.cookies.length,
       domains,
       expiresAt,
-      note: input.note ?? null,
+      note,
     });
 
     this.logger.info('credential.saved', {
@@ -320,9 +440,37 @@ export class CredentialService {
       cookieCount: bundle.cookies.length,
       domains,
       expiresAt,
+      missingRequired: missing,
     });
 
     return toProviderCredentialDto(row);
+  }
+
+  /**
+   * A save is never rejected for being incomplete - the user would simply lose
+   * the paste - so anything we noticed is reported back as a note instead.
+   */
+  private derivedNote(
+    provider: string,
+    bundle: CredentialBundle,
+    missing: string[],
+    expiresAt: string | null,
+  ): string | null {
+    const parts: string[] = [];
+    if (missing.length > 0) {
+      const label = provider.charAt(0).toUpperCase() + provider.slice(1);
+      const names = missing.join(', ');
+      const plural = missing.length === 1 ? 'cookie is' : 'cookies are';
+      parts.push(
+        `Saved, but the ${names} ${plural} missing - ${label} will still treat this session as signed out.`,
+      );
+    }
+    if (expiresAt === null && bundle.cookies.length > 0) {
+      parts.push(
+        'No expiry could be determined from this paste, so the session cannot be aged out automatically - verify it if sign-in starts failing.',
+      );
+    }
+    return parts.length > 0 ? parts.join(' ') : null;
   }
 
   /** Cleartext bundle for the browser and HTTP layers. Never log the result. */

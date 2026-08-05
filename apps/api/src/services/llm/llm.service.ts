@@ -6,7 +6,7 @@ import type { Logger } from '../../core/logger.js';
 import type { EventBus } from '../../core/events.js';
 import type { LlmCallRepository, PromptTemplateRepository } from '../../repositories/observability.repository.js';
 import type { SettingsService } from '../settings.service.js';
-import { createLlmClient } from './providers.js';
+import { createLlmClient, LlmAbortError } from './providers.js';
 import { DEFAULT_PROMPTS, renderTemplate } from './prompts.js';
 import type { ChatMessage, LlmClient, ModelInfo } from './types.js';
 
@@ -121,6 +121,14 @@ export class LlmService {
     private readonly events: EventBus,
   ) {}
 
+  /** Inference calls executing right now, maintained by `run()`. */
+  private inFlight = 0;
+
+  /** Inference calls executing right now. The dashboard's stop controls read this. */
+  activeCalls(): number {
+    return this.inFlight;
+  }
+
   private client(): LlmClient {
     return createLlmClient(this.settingsService.get().llm);
   }
@@ -178,15 +186,25 @@ export class LlmService {
       const startedAt = Date.now();
       let response: Awaited<ReturnType<LlmClient['complete']>> | null = null;
       try {
-        response = await client.complete({
-          model,
-          messages: conversation,
-          temperature: settings.temperature,
-          maxTokens: settings.maxTokens,
-          jsonSchema,
-          timeoutMs: settings.requestTimeoutMs,
-          signal: options.signal,
-        });
+        // Stop pressed between attempts: no further request may be issued.
+        if (options.signal?.aborted) throw new LlmAbortError();
+
+        // Counted per attempt, not per task: a retry is one call at a time, so
+        // releasing it here keeps the gauge equal to the real concurrent load.
+        this.inFlight += 1;
+        try {
+          response = await client.complete({
+            model,
+            messages: conversation,
+            temperature: settings.temperature,
+            maxTokens: settings.maxTokens,
+            jsonSchema,
+            timeoutMs: settings.requestTimeoutMs,
+            signal: options.signal,
+          });
+        } finally {
+          this.inFlight -= 1;
+        }
 
         const parsed: unknown = JSON.parse(extractJson(response.content));
         const validated = schema.parse(parsed);
@@ -233,8 +251,12 @@ export class LlmService {
         };
       } catch (error) {
         const durationMs = Date.now() - startedAt;
-        lastError =
-          error instanceof z.ZodError
+        // An abort is the operator's decision, not a model failure; the row says
+        // so plainly so the call log does not read as an endpoint problem.
+        const aborted = error instanceof LlmAbortError || options.signal?.aborted === true;
+        lastError = aborted
+          ? 'Cancelled by the operator before the model responded (not a model failure)'
+          : error instanceof z.ZodError
             ? `Output failed schema validation: ${JSON.stringify(error.issues).slice(0, 800)}`
             : toErrorMessage(error);
 
@@ -257,6 +279,14 @@ export class LlmService {
         });
 
         this.events.emit('llm.call', { task, model, success: false, totalTokens: null });
+
+        // Retrying a cancelled call would start the very generation the user
+        // asked to stop, so the abort propagates immediately.
+        if (aborted) {
+          this.logger.info('llm task cancelled', { task, attempt });
+          throw error instanceof LlmAbortError ? error : new LlmAbortError();
+        }
+
         this.logger.warn('llm task attempt failed', { task, attempt, error: lastError });
 
         if (attempt > settings.maxRetries) break;
