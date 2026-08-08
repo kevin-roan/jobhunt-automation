@@ -38,6 +38,7 @@ import { KeywordService } from '../services/keyword.service.js';
 import { PipelineService } from '../services/pipeline.service.js';
 import { SourceService } from '../services/source.service.js';
 import { VpnService } from '../services/vpn/vpn.service.js';
+import { BrowserSessionService } from '../services/browser-session.service.js';
 import { CoverLetterService, ResumeService } from '../services/resume.service.js';
 import { ApplicationService } from '../services/application.service.js';
 import { NotificationService } from '../services/notification.service.js';
@@ -94,6 +95,7 @@ export interface Container {
     pipeline: PipelineService;
     sources: SourceService;
     vpn: VpnService;
+    browserSession: BrowserSessionService;
     resumes: ResumeService;
     coverLetters: CoverLetterService;
     applications: ApplicationService;
@@ -177,6 +179,11 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     'sync.publishableKey': supabaseEnv.publishableKey,
     'sync.secretKey': supabaseEnv.secretKey,
     'sync.userId': supabaseEnv.userId,
+    // Undefined unless BROWSER_ATTENDED was set, and `bootstrap` skips
+    // undefined, so this only turns attended mode on where a screen exists —
+    // the container image sets it, a bare-metal install does not.
+    'browser.attended': config.BROWSER_ATTENDED,
+    'browser.sessionStrategy': config.BROWSER_SESSION_STRATEGY,
   });
 
   // Adopt environment credentials into any field the user has left blank. This
@@ -299,6 +306,7 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     llmService,
     settingsService,
     notificationService,
+    keywordService,
     logger.child('applications'),
     events,
   );
@@ -365,7 +373,20 @@ export async function createContainer(config: AppConfig): Promise<Container> {
     repositories.analytics,
     repositories.queue,
     browser,
+    repositories.browserSessions,
     logger.child('sources'),
+  );
+
+  // Attended mode's control surface: opens the one visible window, points it at
+  // a provider's login page, and probes whether the session took. It reads
+  // sign-in state by navigating, never by inspecting cookies.
+  const browserSessionService = new BrowserSessionService(
+    browser,
+    collectors,
+    repositories.browserSessions,
+    settingsService,
+    logger.child('browser-session'),
+    config.REMOTE_VIEW_URL,
   );
 
   const worker = new QueueWorker(
@@ -407,6 +428,8 @@ export async function createContainer(config: AppConfig): Promise<Container> {
   for (const task of createScheduledTasks({
     queue: repositories.queue,
     jobs: repositories.jobs,
+    resumes: repositories.resumes,
+    coverLetters: repositories.coverLetters,
     jobService,
     applicationService,
     settingsService,
@@ -437,6 +460,7 @@ export async function createContainer(config: AppConfig): Promise<Container> {
       pipeline: pipelineService,
       sources: sourceService,
       vpn: vpnService,
+      browserSession: browserSessionService,
       resumes: resumeService,
       coverLetters: coverLetterService,
       applications: applicationService,

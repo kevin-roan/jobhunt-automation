@@ -18,6 +18,13 @@ const scorePayload = jobPayload.extend({ resumeId: z.number().int().positive().n
 const tailorPayload = jobPayload.extend({
   baseResumeId: z.number().int().positive().nullable().optional(),
   force: z.boolean().optional(),
+  /**
+   * Chain a cover letter onto the resume this task produces. The flag lives in
+   * the payload rather than being re-read from Settings by the tailor handler
+   * because it records what was decided when the job was scored — flipping the
+   * toggle afterwards must not retroactively change work already queued.
+   */
+  coverLetter: z.boolean().optional(),
 });
 const coverLetterPayload = jobPayload.extend({
   resumeId: z.number().int().positive().nullable().optional(),
@@ -103,11 +110,64 @@ export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
       const result = await deps.jobService.score(jobId, resumeId ?? null, signal);
 
       const settings = deps.settingsService.get().application;
-      if (
+      const wantsApply =
         settings.autoApply &&
         result.recommendation === 'apply' &&
-        result.score >= settings.minScoreToApply
-      ) {
+        result.score >= settings.minScoreToApply;
+      /**
+       * Deliberately independent of `autoApply`: the documents are the part of
+       * the pipeline the user reviews by hand, so a good job must arrive with a
+       * tailored resume and a cover letter already waiting even when nothing is
+       * ever submitted automatically. Tying them to `autoApply` is what left the
+       * whole feature dormant — `resume.tailor` had one caller behind a flag the
+       * dashboard never sends, and `cover_letter.generate` had none at all.
+       */
+      const wantsDocuments =
+        (settings.tailorResume || settings.generateCoverLetter) &&
+        result.score >= settings.minScoreToTailor;
+      if (!wantsApply && !wantsDocuments) return;
+
+      // This is the dominant source of auto-applies — the scheduler's `apply`
+      // task only mops up what scoring missed — so it needs the same keyword
+      // gate, from the same method, or the gate leaks straight through here.
+      const job = deps.jobs.byId(jobId);
+      // A gate that cannot read the row must refuse, not wave it through: the
+      // job was scored a moment ago, so a missing row here means it was
+      // deleted or archived mid-flight, and enqueuing an apply for it is
+      // wrong for that reason alone.
+      //
+      // The same gate covers the documents. A tailoring pass is two model calls
+      // and a LaTeX compile, and the keyword gate's whole claim is that the user
+      // would never apply to this posting — so spending that on it buys a
+      // document nobody opens. Asked for one by id, the routes tailor it anyway;
+      // this is only the automatic path. Called once, because it logs its skip.
+      if (!job || !deps.applicationService.allowsAutoApply(job)) return;
+
+      if (wantsDocuments) {
+        if (settings.tailorResume) {
+          // The cover letter is not enqueued beside this one: it needs the id of
+          // the resume the tailoring produces, so `resume.tailor` chains it.
+          deps.queue.enqueue({
+            task: 'resume.tailor',
+            payload: {
+              jobId,
+              baseResumeId: settings.defaultResumeId,
+              coverLetter: settings.generateCoverLetter,
+            },
+            dedupeKey: `resume.tailor:${jobId}:${settings.defaultResumeId ?? 'default'}`,
+            priority: 8,
+          });
+        } else if (settings.generateCoverLetter) {
+          deps.queue.enqueue({
+            task: 'cover_letter.generate',
+            payload: { jobId },
+            dedupeKey: `cover_letter.generate:${jobId}`,
+            priority: 7,
+          });
+        }
+      }
+
+      if (wantsApply) {
         deps.queue.enqueue({
           task: 'application.apply',
           payload: { jobId },
@@ -122,12 +182,26 @@ export function createHandlers(deps: HandlerDependencies): TaskHandlerMap {
     'resume.tailor': async (payload, _job, signal) => {
       if (signal.aborted) return;
       const input = parse(tailorPayload, payload);
-      await deps.resumeService.tailorForJob({
+      const tailored = await deps.resumeService.tailorForJob({
         jobId: input.jobId,
         baseResumeId: input.baseResumeId ?? null,
         force: input.force ?? false,
         signal,
       });
+
+      // Chained rather than enqueued alongside the tailoring, for two reasons:
+      // only this point knows which resume version was produced, and a letter
+      // that argues from the base document while the tailored one is uploaded
+      // contradicts the resume it is stapled to. An abort between the two leaves
+      // the resume done and no letter — the next scoring re-arms the same key.
+      if (input.coverLetter && !signal.aborted) {
+        deps.queue.enqueue({
+          task: 'cover_letter.generate',
+          payload: { jobId: input.jobId, resumeId: tailored.id },
+          dedupeKey: `cover_letter.generate:${input.jobId}`,
+          priority: 7,
+        });
+      }
     },
 
     'cover_letter.generate': async (payload, _job, signal) => {

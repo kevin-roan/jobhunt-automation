@@ -3,6 +3,7 @@ import { zodToJsonSchema } from 'zod-to-json-schema';
 import { LLM_OUTPUT_SCHEMAS, type LlmTask } from '@deedy/shared';
 import { ConfigurationError, LlmError, toErrorMessage } from '../../core/errors.js';
 import type { Logger } from '../../core/logger.js';
+import { Redactor } from '../../core/redact.js';
 import type { EventBus } from '../../core/events.js';
 import type { LlmCallRepository, PromptTemplateRepository } from '../../repositories/observability.repository.js';
 import type { SettingsService } from '../settings.service.js';
@@ -119,10 +120,24 @@ export class LlmService {
     private readonly prompts: PromptTemplateRepository,
     private readonly logger: Logger,
     private readonly events: EventBus,
-  ) {}
+  ) {
+    this.redactor = new Redactor(settingsService);
+  }
 
   /** Inference calls executing right now, maintained by `run()`. */
   private inFlight = 0;
+
+  /**
+   * Applied to the `llm_calls` COPY of a prompt only.
+   *
+   * `userPrompt` is the rendered template, so it physically contains the
+   * candidate's email, phone and the entire resume; storing it verbatim turned
+   * an audit trail into the most complete PII dump in the database. The model
+   * still receives `conversation` untouched - that is the whole point, the
+   * tailoring is worthless without the real values - and only what is written
+   * to the table is scrubbed.
+   */
+  private readonly redactor: Redactor;
 
   /** Inference calls executing right now. The dashboard's stop controls read this. */
   activeCalls(): number {
@@ -214,9 +229,13 @@ export class LlmService {
           task,
           provider: settings.provider,
           model: response.model,
-          systemPrompt: conversation[0]?.content ?? '',
-          userPrompt: conversation[conversation.length - 1]?.content ?? '',
-          response: response.content,
+          // Redacted at the write, not at the source: `conversation` above is
+          // still the real, unredacted text that went to the model.
+          systemPrompt: this.redactor.text(conversation[0]?.content ?? ''),
+          userPrompt: this.redactor.text(conversation[conversation.length - 1]?.content ?? ''),
+          // A tailored resume or a filled answer echoes the profile straight
+          // back, so the response is no safer to store than the prompt.
+          response: this.redactor.text(response.content),
           promptTokens: response.usage.promptTokens,
           completionTokens: response.usage.completionTokens,
           totalTokens: response.usage.totalTokens,
@@ -264,16 +283,17 @@ export class LlmService {
           task,
           provider: settings.provider,
           model,
-          systemPrompt: conversation[0]?.content ?? '',
-          userPrompt: conversation[conversation.length - 1]?.content ?? '',
-          response: response?.content ?? null,
+          systemPrompt: this.redactor.text(conversation[0]?.content ?? ''),
+          userPrompt: this.redactor.text(conversation[conversation.length - 1]?.content ?? ''),
+          response: this.redactor.nullable(response?.content ?? null),
           promptTokens: response?.usage.promptTokens ?? null,
           completionTokens: response?.usage.completionTokens ?? null,
           totalTokens: response?.usage.totalTokens ?? null,
           durationMs,
           success: false,
           attempt,
-          error: lastError,
+          // Schema-validation failures quote the offending output verbatim.
+          error: this.redactor.text(lastError),
           jobId: options.jobId ?? null,
           applicationId: options.applicationId ?? null,
         });

@@ -1,6 +1,6 @@
 import type { Locator, Page } from 'playwright';
 import { sleep, truncate } from '../../core/utils.js';
-import { fieldSelector, scanFields } from '../form.filler.js';
+import { fieldSelector, isFieldEmpty, scanFields, type FormField } from '../form.filler.js';
 import { fillVisibleFields } from './form.applier.js';
 import {
   dismissConsentBanners,
@@ -34,6 +34,67 @@ async function firstVisible(page: Page, selectors: string[]): Promise<Locator | 
     }
   }
   return null;
+}
+
+const COVER_LETTER_HINT = /cover|letter|motivation/;
+
+function isCoverLetterField(field: FormField): boolean {
+  return COVER_LETTER_HINT.test(`${field.label} ${field.name}`.toLowerCase());
+}
+
+/**
+ * Attaches or types the cover letter on whichever wizard page exposes a target.
+ *
+ * The wizard flow used to have no cover-letter step at all, so a letter the
+ * pipeline had generated was silently dropped. Each page is offered the letter
+ * until one takes it; `pending` keeps trying, `done` and `failed` stop.
+ */
+async function offerCoverLetter(
+  page: Page,
+  fields: FormField[],
+  context: ApplyContext,
+): Promise<'pending' | 'done' | 'failed'> {
+  const { coverLetterPath, coverLetterText } = context.documents;
+
+  const fileField = fields.find((field) => field.kind === 'file' && isCoverLetterField(field));
+  if (fileField && coverLetterPath) {
+    await context.recordStep('upload_cover_letter', 'running');
+    try {
+      await page.locator(fieldSelector(fileField)).setInputFiles(coverLetterPath);
+      await sleep(1500);
+      await context.recordStep('upload_cover_letter', 'succeeded', { message: coverLetterPath });
+      return 'done';
+    } catch (error) {
+      await context.recordStep('upload_cover_letter', 'failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 'failed';
+    }
+  }
+
+  const textField = fields.find(
+    (field) =>
+      (field.kind === 'textarea' || field.kind === 'text') &&
+      !field.currentValue &&
+      isCoverLetterField(field),
+  );
+  if (textField && coverLetterText) {
+    await context.recordStep('upload_cover_letter', 'running');
+    try {
+      await page.locator(fieldSelector(textField)).fill(coverLetterText);
+      await context.recordStep('upload_cover_letter', 'succeeded', {
+        message: `typed ${coverLetterText.length} characters into ${textField.label || textField.name}`,
+      });
+      return 'done';
+    } catch (error) {
+      await context.recordStep('upload_cover_letter', 'failed', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return 'failed';
+    }
+  }
+
+  return 'pending';
 }
 
 /**
@@ -79,6 +140,20 @@ export function createWizardApplier(config: WizardApplierConfig): ApplierDefinit
 
       let resumeAttached = false;
       let submitted = false;
+      let coverLetter: 'pending' | 'done' | 'failed' = 'pending';
+      const hasCoverLetter = Boolean(
+        context.documents.coverLetterPath ?? context.documents.coverLetterText,
+      );
+
+      /** Records the absent cover letter once, so it is visible rather than missing. */
+      const noteCoverLetterOutcome = async (): Promise<void> => {
+        if (coverLetter !== 'pending') return;
+        await context.recordStep('upload_cover_letter', 'skipped', {
+          message: hasCoverLetter
+            ? 'no cover letter field appeared anywhere in the wizard'
+            : 'no cover letter was generated for this application',
+        });
+      };
 
       for (let pageIndex = 0; pageIndex < config.maxPages; pageIndex += 1) {
         const fields = await scanFields(page);
@@ -102,6 +177,12 @@ export function createWizardApplier(config: WizardApplierConfig): ApplierDefinit
           }
         }
 
+        // Re-scan: attaching the resume re-renders enough of a wizard page to
+        // invalidate the indices stamped above.
+        if (coverLetter === 'pending') {
+          coverLetter = await offerCoverLetter(page, await scanFields(page), context);
+        }
+
         await context.recordStep('fill_form', 'running', {
           message: `wizard page ${pageIndex + 1}`,
         });
@@ -117,6 +198,23 @@ export function createWizardApplier(config: WizardApplierConfig): ApplierDefinit
 
         const submitButton = await firstVisible(page, config.submitButtons);
         if (submitButton) {
+          await noteCoverLetterOutcome();
+
+          // Same gate as the single-page applier: an incomplete application is
+          // not submitted on the candidate's behalf, dry run or not.
+          const remaining = (await scanFields(page)).filter(
+            (entry) => entry.required && entry.kind !== 'file' && isFieldEmpty(entry),
+          );
+          if (remaining.length > 0) {
+            const labels = remaining.map((entry) => entry.label || entry.name).slice(0, 20);
+            const error = `${remaining.length} required field(s) still empty: ${truncate(
+              labels.join(', '),
+              300,
+            )}`;
+            await context.recordStep('review', 'failed', { error, data: { remaining: labels } });
+            return { submitted: false, confirmationText: null, needsHuman: error };
+          }
+
           await context.recordStep('review', 'succeeded', {
             message: `reached final page after ${pageIndex + 1} steps`,
           });
@@ -151,6 +249,7 @@ export function createWizardApplier(config: WizardApplierConfig): ApplierDefinit
       }
 
       if (!submitted) {
+        await noteCoverLetterOutcome();
         const error = `Wizard exceeded ${config.maxPages} pages without reaching a submit button`;
         await context.recordStep('review', 'failed', { error });
         return { submitted: false, confirmationText: null, needsHuman: error };

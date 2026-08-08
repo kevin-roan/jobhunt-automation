@@ -6,14 +6,26 @@ import {
   logQuerySchema,
   paginationSchema,
   promptTemplateDtoSchema,
+  queryBooleanSchema,
 } from '@deedy/shared';
 import { NotFoundError } from '../../core/errors.js';
 import type { Container } from '../../core/container.js';
+import { Redactor } from '../../core/redact.js';
 import { DEFAULT_PROMPTS } from '../../services/llm/prompts.js';
 import { commonErrors, idParamSchema, okSchema, paginatedSchema, type ApiInstance } from '../types.js';
 
 export async function observabilityRoutes(app: ApiInstance, container: Container): Promise<void> {
   const { logs, llmCalls, promptTemplates, analytics } = container.repositories;
+
+  /**
+   * Second line of defence for the one endpoint that serves stored prompts.
+   * `LlmService` now redacts before writing, but rows recorded before that fix
+   * still hold the candidate's full profile and resume, and this route is the
+   * only path that reaches them - `toLlmCallDto` deliberately omits the three
+   * text columns everywhere else. Scrubbing on serialisation too means an old
+   * row cannot be read back out through the API.
+   */
+  const redactor = new Redactor(container.services.settings);
 
   app.get(
     '/logs',
@@ -48,7 +60,7 @@ export async function observabilityRoutes(app: ApiInstance, container: Container
         summary: 'List LLM activity',
         querystring: paginationSchema.extend({
           task: llmTaskSchema.optional(),
-          success: z.coerce.boolean().optional(),
+          success: queryBooleanSchema.optional(),
         }),
         response: { 200: paginatedSchema(llmCallDtoSchema), ...commonErrors },
       },
@@ -87,12 +99,12 @@ export async function observabilityRoutes(app: ApiInstance, container: Container
         durationMs: row.durationMs,
         success: row.success,
         attempt: row.attempt,
-        error: row.error,
+        error: redactor.nullable(row.error),
         jobId: row.jobId,
         createdAt: row.createdAt,
-        systemPrompt: row.systemPrompt,
-        userPrompt: row.userPrompt,
-        response: row.response,
+        systemPrompt: redactor.nullable(row.systemPrompt),
+        userPrompt: redactor.nullable(row.userPrompt),
+        response: redactor.nullable(row.response),
       };
     },
   );

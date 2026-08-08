@@ -1,5 +1,10 @@
 import { z } from 'zod';
-import { notificationDtoSchema, notificationKindSchema, paginationSchema } from '@deedy/shared';
+import {
+  notificationDtoSchema,
+  notificationKindSchema,
+  paginationSchema,
+  queryBooleanSchema,
+} from '@deedy/shared';
 import { NotFoundError } from '../../core/errors.js';
 import type { Container } from '../../core/container.js';
 import { commonErrors, idParamSchema, okSchema, paginatedSchema, type ApiInstance } from '../types.js';
@@ -14,7 +19,7 @@ export async function notificationRoutes(app: ApiInstance, container: Container)
         tags: ['observability'],
         summary: 'List notifications, newest first',
         querystring: paginationSchema.extend({
-          unreadOnly: z.coerce.boolean().optional(),
+          unreadOnly: queryBooleanSchema.optional(),
           kind: notificationKindSchema.optional(),
         }),
         response: { 200: paginatedSchema(notificationDtoSchema), ...commonErrors },

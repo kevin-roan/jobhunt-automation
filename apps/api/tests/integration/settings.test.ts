@@ -280,7 +280,17 @@ describe('SettingsService secrets', () => {
     harness.service.update({
       llm: { apiKey: API_KEY },
       notifications: { webhookUrl: 'http://localhost:8080/hook/abcd1234' },
-      sync: { secretKey: 'sb_secret_test_value_1234567890' },
+      vpn: {
+        connectCommand: 'openvpn --config /etc/vpn.conf --auth-user-pass /etc/vpn.creds',
+        disconnectCommand: 'pkill openvpn',
+        statusCommand: 'pgrep openvpn',
+      },
+      sync: {
+        secretKey: 'sb_secret_test_value_1234567890',
+        url: 'https://project-ref.supabase.co',
+        publishableKey: 'sb_publishable_test_value_123456',
+        userId: '4f9c2c1e-2f1a-4f6a-9a3f-2c9d5b7e1a10',
+      },
     });
 
     for (const secretPath of SECRET_SETTING_PATHS) {

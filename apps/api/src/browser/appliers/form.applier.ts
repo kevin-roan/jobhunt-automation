@@ -3,6 +3,7 @@ import { sleep, truncate } from '../../core/utils.js';
 import {
   fieldSelector,
   fillField,
+  isFieldEmpty,
   resolveFromProfile,
   scanFields,
   type FormField,
@@ -109,6 +110,19 @@ export async function fillVisibleFields(
     if (field.kind === 'file') continue;
     if (field.currentValue && field.kind !== 'checkbox' && field.kind !== 'radio') continue;
     if (!field.label && !field.name) continue;
+
+    // Certifications, attestations and signatures are the candidate's to make.
+    // Neither the profile nor the LLM gets a vote, so this escalates before
+    // either is consulted — unless the page already carries the answer.
+    if (field.isAttestation) {
+      if (isFieldEmpty(field)) {
+        return {
+          filled,
+          needsHuman: `Attestation must be signed by you: ${field.label || field.name}`,
+        };
+      }
+      continue;
+    }
 
     const fromProfile = resolveFromProfile(field, context.profile);
     let value = fromProfile?.value ?? null;
@@ -296,11 +310,25 @@ export function createFormApplier(config: FormApplierConfig): ApplierDefinition 
 
       await context.recordStep('review', 'running');
       const remaining = (await scanFields(root)).filter(
-        (field) => field.required && !field.currentValue && field.kind !== 'file',
+        (field) => field.required && field.kind !== 'file' && isFieldEmpty(field),
       );
+      const remainingLabels = remaining.map((field) => field.label || field.name).slice(0, 20);
+
+      // A required field we could not answer means the employer would receive an
+      // incomplete application under the candidate's name. Hand it back instead —
+      // including in a dry run, where the point is to report what a real run would
+      // have hit.
+      if (remaining.length > 0) {
+        const error = `${remaining.length} required field(s) still empty: ${truncate(
+          remainingLabels.join(', '),
+          300,
+        )}`;
+        await context.recordStep('review', 'failed', { error, data: { remaining: remainingLabels } });
+        return { submitted: false, confirmationText: null, needsHuman: error };
+      }
+
       await context.recordStep('review', 'succeeded', {
-        message: `${remaining.length} required fields still empty`,
-        data: { remaining: remaining.map((field) => field.label).slice(0, 20) },
+        message: 'all required fields are answered',
       });
 
       if (context.dryRun) {

@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
+import { AuthGate } from '@/components/AuthGate';
 import { Shell } from '@/components/layout/Shell';
 import { LiveEventsProvider } from '@/lib/events';
 import OverviewPage from '@/pages/Overview';
@@ -21,29 +22,36 @@ import SettingsPage from '@/pages/Settings';
 export default function App(): JSX.Element {
   // The one and only SSE subscription: mounted here so every page benefits from
   // live invalidation, and provided as context so no page opens a second socket.
+  //
+  // AuthGate wraps it rather than sitting inside Shell, and that ordering is
+  // load-bearing: EventSource cannot send a header, so the stream URL carries
+  // the token inline and is only correct once a token is stored. Mounting the
+  // provider behind the gate means the socket is opened after that, never before.
   return (
-    <LiveEventsProvider>
-      <Shell>
-        <Routes>
-          <Route path="/" element={<OverviewPage />} />
-          <Route path="/jobs" element={<JobsPage />} />
-          <Route path="/jobs/:id" element={<JobDetailPage />} />
-          <Route path="/sources" element={<SourcesPage />} />
-          <Route path="/keywords" element={<KeywordsPage />} />
-          <Route path="/applications" element={<ApplicationsPage />} />
-          <Route path="/applications/:id" element={<ApplicationDetailPage />} />
-          <Route path="/resumes" element={<ResumesPage />} />
-          <Route path="/cover-letters" element={<CoverLettersPage />} />
-          <Route path="/queue" element={<QueuePage />} />
-          <Route path="/browser" element={<BrowserSessionsPage />} />
-          <Route path="/llm" element={<LlmActivityPage />} />
-          <Route path="/logs" element={<LogsPage />} />
-          <Route path="/notifications" element={<NotificationsPage />} />
-          <Route path="/analytics" element={<AnalyticsPage />} />
-          <Route path="/settings" element={<SettingsPage />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </Shell>
-    </LiveEventsProvider>
+    <AuthGate>
+      <LiveEventsProvider>
+        <Shell>
+          <Routes>
+            <Route path="/" element={<OverviewPage />} />
+            <Route path="/jobs" element={<JobsPage />} />
+            <Route path="/jobs/:id" element={<JobDetailPage />} />
+            <Route path="/sources" element={<SourcesPage />} />
+            <Route path="/keywords" element={<KeywordsPage />} />
+            <Route path="/applications" element={<ApplicationsPage />} />
+            <Route path="/applications/:id" element={<ApplicationDetailPage />} />
+            <Route path="/resumes" element={<ResumesPage />} />
+            <Route path="/cover-letters" element={<CoverLettersPage />} />
+            <Route path="/queue" element={<QueuePage />} />
+            <Route path="/browser" element={<BrowserSessionsPage />} />
+            <Route path="/llm" element={<LlmActivityPage />} />
+            <Route path="/logs" element={<LogsPage />} />
+            <Route path="/notifications" element={<NotificationsPage />} />
+            <Route path="/analytics" element={<AnalyticsPage />} />
+            <Route path="/settings" element={<SettingsPage />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Shell>
+      </LiveEventsProvider>
+    </AuthGate>
   );
 }

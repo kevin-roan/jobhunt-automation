@@ -1,16 +1,23 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Page } from 'playwright';
-import { DEFAULT_SETTINGS, type Settings } from '@deedy/shared';
+import { DEFAULT_SETTINGS, type SessionStrategy, type Settings } from '@deedy/shared';
 
 import { ashbyCollector } from '../../src/collectors/ashby.collector.js';
 import { greenhouseCollector } from '../../src/collectors/greenhouse.collector.js';
 import { leverCollector } from '../../src/collectors/lever.collector.js';
 import {
+  challengeFixHint,
   isChallengePage,
   isSignedOutUrl,
   linkedinCollector,
+  noListingsFixHint,
+  searchChallengeFixHint,
+  sessionFixHint as linkedinSessionFixHint,
 } from '../../src/collectors/linkedin.collector.js';
-import { indeedCollector } from '../../src/collectors/indeed.collector.js';
+import {
+  indeedCollector,
+  sessionFixHint as indeedSessionFixHint,
+} from '../../src/collectors/indeed.collector.js';
 import { recruiteeCollector } from '../../src/collectors/recruitee.collector.js';
 import { smartRecruitersCollector } from '../../src/collectors/smartrecruiters.collector.js';
 import { workableCollector } from '../../src/collectors/workable.collector.js';
@@ -481,6 +488,109 @@ describe('linkedin session detection helpers', () => {
       false,
     );
     expect(isChallengePage('', '')).toBe(false);
+  });
+});
+
+describe('mode-aware session hints', () => {
+  function withSession(attended: boolean, sessionStrategy: SessionStrategy = 'auto'): Settings {
+    return {
+      ...DEFAULT_SETTINGS,
+      browser: { ...DEFAULT_SETTINGS.browser, attended, sessionStrategy },
+    };
+  }
+
+  /** Every hint that has to name a repair, so a new one cannot skip the branch. */
+  function everyHint(settings: Settings): string[] {
+    return [
+      linkedinSessionFixHint(settings),
+      challengeFixHint(settings),
+      searchChallengeFixHint(settings),
+      noListingsFixHint(settings),
+      indeedSessionFixHint(settings),
+    ];
+  }
+
+  const attended = withSession(true);
+  const headless = withSession(false);
+
+  it('tells the attended user to sign in the window that is already open', () => {
+    for (const hint of [
+      linkedinSessionFixHint(attended),
+      challengeFixHint(attended),
+      indeedSessionFixHint(attended),
+    ]) {
+      expect(hint).toContain('press Sign in');
+      expect(hint).toContain('a window is already open on this machine');
+      // Pasting a cookie is exactly the advice attended mode exists to avoid.
+      expect(hint).not.toContain('paste');
+    }
+    expect(linkedinSessionFixHint(attended)).toContain('Sign in for LinkedIn');
+    expect(indeedSessionFixHint(attended)).toContain('Sign in for Indeed');
+  });
+
+  it('keeps the paste-a-session advice for headless runs', () => {
+    for (const hint of [
+      linkedinSessionFixHint(headless),
+      challengeFixHint(headless),
+      indeedSessionFixHint(headless),
+    ]) {
+      expect(hint).toContain('Browser Sessions');
+      expect(hint).not.toContain('press Sign in');
+    }
+    expect(linkedinSessionFixHint(headless)).toContain('`li_at` cookie');
+    expect(indeedSessionFixHint(headless)).toContain('paste a fresh Indeed session');
+  });
+
+  it('never gives the same instruction in both modes', () => {
+    expect(linkedinSessionFixHint(attended)).not.toBe(linkedinSessionFixHint(headless));
+    expect(challengeFixHint(attended)).not.toBe(challengeFixHint(headless));
+    expect(indeedSessionFixHint(attended)).not.toBe(indeedSessionFixHint(headless));
+  });
+
+  it('advises the window for every hint under the attended strategy', () => {
+    for (const hint of everyHint(withSession(false, 'attended'))) {
+      expect(hint).toContain('press Sign in');
+      expect(hint).not.toContain('paste');
+    }
+  });
+
+  it('advises pasting for every hint under the stored strategy', () => {
+    for (const hint of everyHint(withSession(true, 'stored'))) {
+      expect(hint).toMatch(/paste|Browser Sessions/);
+      expect(hint).not.toContain('press Sign in');
+    }
+  });
+
+  /**
+   * The whole point of the explicit setting: the visible window can be open for
+   * debugging while a pasted cookie is still what the run replays, and advice
+   * that reads the raw switch would send the user to sign in to a session no
+   * collector is going to use.
+   */
+  it('honours stored pinned while attended mode is on', () => {
+    const pinned = withSession(true, 'stored');
+
+    expect(linkedinSessionFixHint(pinned)).toBe(linkedinSessionFixHint(headless));
+    expect(challengeFixHint(pinned)).toBe(challengeFixHint(headless));
+    expect(indeedSessionFixHint(pinned)).toBe(indeedSessionFixHint(headless));
+    expect(linkedinSessionFixHint(pinned)).toContain('`li_at` cookie');
+  });
+
+  /** And the reverse: a headless host driving a signed-in shared profile. */
+  it('honours attended pinned while the attended switch is off', () => {
+    const pinned = withSession(false, 'attended');
+
+    expect(linkedinSessionFixHint(pinned)).toBe(linkedinSessionFixHint(attended));
+    expect(challengeFixHint(pinned)).toBe(challengeFixHint(attended));
+    expect(indeedSessionFixHint(pinned)).toBe(indeedSessionFixHint(attended));
+    expect(indeedSessionFixHint(pinned)).toContain('Sign in for Indeed');
+  });
+
+  it('follows the attended switch when the strategy is left on auto', () => {
+    expect(linkedinSessionFixHint(withSession(true, 'auto'))).toBe(linkedinSessionFixHint(attended));
+    expect(linkedinSessionFixHint(withSession(false, 'auto'))).toBe(
+      linkedinSessionFixHint(headless),
+    );
   });
 });
 

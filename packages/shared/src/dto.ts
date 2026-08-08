@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import {
+  sessionStrategySchema,
   applicationStatusSchema,
   credentialKindSchema,
   credentialStatusSchema,
@@ -25,6 +26,16 @@ import {
   resumeFontSchema,
   stepStatusSchema,
 } from './enums.js';
+
+/**
+ * Booleans arriving in a query string. `z.coerce.boolean()` is JS truthiness —
+ * the string "false" coerces to `true` — so every flag must be parsed by value.
+ */
+export const queryBooleanSchema = z
+  .union([z.boolean(), z.enum(['true', 'false', '1', '0', 'yes', 'no'])])
+  .transform((value) =>
+    typeof value === 'boolean' ? value : value === 'true' || value === '1' || value === 'yes',
+  );
 
 export const paginationSchema = z.object({
   page: z.coerce.number().int().min(1).default(1),
@@ -80,7 +91,7 @@ export const jobQuerySchema = paginationSchema.extend({
   minScore: z.coerce.number().min(0).max(100).optional(),
   maxScore: z.coerce.number().min(0).max(100).optional(),
   recommendation: recommendationSchema.optional(),
-  archived: z.coerce.boolean().optional(),
+  archived: queryBooleanSchema.optional(),
   sort: z.enum(['collectedAt', 'postedAt', 'score', 'company', 'title']).default('collectedAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
 });
@@ -554,6 +565,75 @@ export const sourceStatusDtoSchema = z.object({
   blockedReason: z.string().nullable(),
 });
 export type SourceStatusDto = z.infer<typeof sourceStatusDtoSchema>;
+
+/* -------------------------------------------------------------------------- */
+/* Attended browser                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Whether a provider's session is live in the shared profile. Derived by
+ * probing the site, not by reading a cookie the user pasted — the whole point
+ * of attended mode is that no cookie is ever handled by hand.
+ */
+export const providerSessionDtoSchema = z.object({
+  provider: z.string(),
+  name: z.string(),
+  /** Whether a collector for this provider needs a signed-in session at all. */
+  requiresAuth: z.boolean(),
+  signedIn: z.boolean(),
+  /** Null when it has never been probed. */
+  checkedAt: z.string().nullable(),
+  /** The page a "Sign in" button should open for this provider. */
+  loginUrl: z.string(),
+  note: z.string().nullable(),
+});
+export type ProviderSessionDto = z.infer<typeof providerSessionDtoSchema>;
+
+export const browserSessionStatusSchema = z.object({
+  /** Whether attended mode is switched on in Settings. */
+  attended: z.boolean(),
+  /** The configured choice, `auto` included. */
+  sessionStrategy: sessionStrategySchema,
+  /**
+   * `auto` resolved — what runs will actually use. Surfaced separately so the
+   * dashboard can state the consequence ("collectors use the signed-in window")
+   * rather than making the user work it out from two switches.
+   */
+  effectiveSessionStrategy: z.enum(['attended', 'stored']),
+  /**
+   * Whether a visible browser could actually be opened here. False on a
+   * headless server or inside a container, with the reason spelled out.
+   */
+  displayAvailable: z.boolean(),
+  unavailableReason: z.string().nullable(),
+  /** Whether the shared window is open right now. */
+  running: z.boolean(),
+  /** Tabs currently open in it. */
+  openPages: z.number().int(),
+  /** URLs of those tabs, so the dashboard can show what it is doing. */
+  pageUrls: z.array(z.string()),
+  engine: z.string(),
+  /**
+   * Viewer for the screen the window is drawn on, when it is not a screen the
+   * user is sitting in front of — noVNC in the Docker image. Null on a desktop
+   * install, where the window simply appears on their own monitor.
+   */
+  remoteViewUrl: z.string().nullable(),
+  /** On-disk profile the session persists in. */
+  profilePath: z.string().nullable(),
+  /** Every provider that needs a login, and whether it currently has one. */
+  providers: z.array(providerSessionDtoSchema),
+});
+export type BrowserSessionStatus = z.infer<typeof browserSessionStatusSchema>;
+
+export const browserSessionControlSchema = z.object({
+  action: z.enum(['open', 'close', 'signin', 'check']),
+  /** Which provider to open a login tab for, or to probe. */
+  provider: z.string().min(1).max(60).optional(),
+  /** Override the page a `signin` opens; defaults to the provider's login URL. */
+  url: z.string().url().optional(),
+});
+export type BrowserSessionControlInput = z.infer<typeof browserSessionControlSchema>;
 
 /* -------------------------------------------------------------------------- */
 /* VPN exit location                                                          */

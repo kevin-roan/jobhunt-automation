@@ -19,6 +19,10 @@ set -Eeuo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# Captured before the defaults are applied so the .env load below can tell an
+# explicit `APP_PORT=9000 ./start.sh` apart from the fallback.
+APP_PORT_OVERRIDE="${APP_PORT:-}"
+OLLAMA_PORT_OVERRIDE="${OLLAMA_PORT:-}"
 APP_PORT="${APP_PORT:-8080}"
 OLLAMA_PORT="${OLLAMA_PORT:-11434}"
 DEEDY_MODEL="${DEEDY_MODEL:-qwen3:8b}"
@@ -136,6 +140,16 @@ EOF
   ok ".env created with a fresh 32-byte encryption key"
 else
   ok ".env found - reusing the existing encryption key"
+  # Compose reads .env for the port mapping, so this script has to as well.
+  # Otherwise a non-default APP_PORT makes the conflict check guard the wrong
+  # port, and the health poll and printed URLs point somewhere nothing is bound.
+  # An explicit shell override still wins, hence the ${VAR:-} guards.
+  while IFS='=' read -r key value; do
+    case "$key" in
+      APP_PORT) APP_PORT="${APP_PORT_OVERRIDE:-$value}" ;;
+      OLLAMA_PORT) OLLAMA_PORT="${OLLAMA_PORT_OVERRIDE:-$value}" ;;
+    esac
+  done < <(grep -E '^(APP_PORT|OLLAMA_PORT)=' .env || true)
 fi
 
 # --------------------------------------------------------------------------
@@ -228,7 +242,17 @@ fi
 # --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
-STATUS_JSON="$(curl -fsS "http://127.0.0.1:${APP_PORT}/api/health" 2>/dev/null || echo '{}')"
+# /api now requires the bearer token. `/api/health/live` stays open for the
+# healthcheck, but the dependency report below does not, so the token is read
+# straight from the volume — this script already has the container.
+API_TOKEN_VALUE="${API_TOKEN:-$(docker compose exec -T app cat /data/.api-token 2>/dev/null | tr -d '\r\n')}"
+
+if [[ -n "$API_TOKEN_VALUE" ]]; then
+  STATUS_JSON="$(curl -fsS -H "Authorization: Bearer ${API_TOKEN_VALUE}" \
+    "http://127.0.0.1:${APP_PORT}/api/health" 2>/dev/null || echo '{}')"
+else
+  STATUS_JSON='{}'
+fi
 LLM_OK="$(printf '%s' "$STATUS_JSON" | grep -o '"reachable":[a-z]*' | head -1 | cut -d: -f2)"
 
 printf '\n%sDeedy Automation is running%s\n\n' "$BOLD$GREEN" "$RESET"
@@ -236,6 +260,16 @@ printf '  Dashboard   %shttp://localhost:%s%s\n' "$BOLD" "$APP_PORT" "$RESET"
 printf '  API docs    %shttp://localhost:%s/docs%s\n' "$DIM" "$APP_PORT" "$RESET"
 printf '  Health      %shttp://localhost:%s/api/health%s\n' "$DIM" "$APP_PORT" "$RESET"
 [[ $WITH_LLM -eq 1 ]] && printf '  Ollama      %shttp://localhost:%s%s\n' "$DIM" "$OLLAMA_PORT" "$RESET"
+
+# The dashboard asks for this on first load. Printing it here is the difference
+# between "it works" and being locked out of your own machine; it is a local
+# secret on a loopback-bound port, and it is already in the container log.
+if [[ -n "$API_TOKEN_VALUE" ]]; then
+  printf '\n  API token   %s%s%s\n' "$BOLD" "$API_TOKEN_VALUE" "$RESET"
+  printf '              %spaste this into the dashboard once; stored in your browser%s\n' "$DIM" "$RESET"
+else
+  warn "could not read the API token; get it with: docker compose exec app cat /data/.api-token"
+fi
 
 printf '\n%sNext steps%s\n' "$BOLD" "$RESET"
 if [[ "${LLM_OK:-false}" != "true" ]]; then

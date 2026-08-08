@@ -1,5 +1,5 @@
 import type { LlmProvider, LlmSettings } from '@deedy/shared';
-import { LlmError } from '../../core/errors.js';
+import { ConfigurationError, LlmError } from '../../core/errors.js';
 import type {
   ChatMessage,
   CompletionRequest,
@@ -281,7 +281,121 @@ const OPENAI_COMPATIBLE: LlmProvider[] = [
   'openrouter_local',
 ];
 
+/** RFC1918, plus loopback and link-local, in the v4 space. */
+function isPrivateIpv4(host: string): boolean {
+  const octets = host.split('.');
+  if (octets.length !== 4) return false;
+  const parts = octets.map((part) => (/^\d{1,3}$/.test(part) ? Number(part) : -1));
+  if (parts.some((part) => part < 0 || part > 255)) return false;
+  const [a, b] = parts as [number, number, number, number];
+  if (a === 127) return true; // 127.0.0.0/8 — all of it, not just .0.0.1
+  if (a === 10) return true; // 10.0.0.0/8
+  if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+  if (a === 192 && b === 168) return true; // 192.168.0.0/16
+  if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+  return false;
+}
+
+function isPrivateIpv6(host: string): boolean {
+  // `new URL(...).hostname` keeps the brackets on a v6 literal.
+  const address = host.replace(/^\[/, '').replace(/\]$/, '').toLowerCase();
+  if (address === '::1' || address === '::') return true;
+
+  // IPv4-mapped addresses, judged on the v4 part they carry. Both spellings
+  // matter: a user types `::ffff:127.0.0.1`, but WHATWG `URL` normalises the
+  // host and hands back the compressed hex form `::ffff:7f00:1`, so checking
+  // only the dotted spelling would reject a loopback the user correctly typed.
+  const dotted = /^::(?:ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/.exec(address);
+  if (dotted?.[1]) return isPrivateIpv4(dotted[1]);
+  const hex = /^::(?:ffff:)?([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(address);
+  if (hex?.[1] && hex[2]) {
+    const high = Number.parseInt(hex[1], 16);
+    const low = Number.parseInt(hex[2], 16);
+    return isPrivateIpv4(
+      [high >> 8, high & 0xff, low >> 8, low & 0xff].join('.'),
+    );
+  }
+  if (/^fe[89ab][0-9a-f]?:/.test(address)) return true; // fe80::/10 link-local
+  if (/^f[cd][0-9a-f]{2}:/.test(address)) return true; // fc00::/7 unique local
+  return false;
+}
+
+/**
+ * Whether a base URL's host is one we are willing to call "this machine or its
+ * private network" without asking.
+ *
+ * The rule is deliberately about the *shape of the name*, not a DNS lookup.
+ * `createLlmClient` is synchronous and runs on every call, and resolving here
+ * would be both a blocking round trip and a TOCTOU illusion — the answer can
+ * change between the check and the socket. What this reliably stops is the case
+ * that actually happens: someone pastes a hosted provider's URL into the Base
+ * URL box and every prompt, with the candidate's full resume in it, silently
+ * ships off the host.
+ *
+ * Accepted:
+ *   - `localhost`, `*.localhost`, and any loopback/RFC1918/link-local literal
+ *   - `*.local` — mDNS, which by definition only answers on the link
+ *   - `*.internal` — covers `host.docker.internal`, which this project's own
+ *     install docs tell users to point at a host-side Ollama
+ *   - a bare single-label hostname such as `ollama`
+ *
+ * The single-label case is the interesting one, and this project depends on it:
+ * `start.sh` and the compose docs configure `http://ollama:11434`, so rejecting
+ * a dotless name would break the shipped configuration on first run. It is also
+ * defensible on its own terms. A name with no dot has no registrable public
+ * suffix and cannot be resolved by public DNS; it can only be answered by
+ * something the operator already controls — `/etc/hosts`, Docker's embedded DNS
+ * on a compose network, a Kubernetes service, or the LAN's own resolver. Nobody
+ * can buy `ollama` and have it resolve for you.
+ *
+ * The honest gap: a resolver configured with a search domain can expand a bare
+ * `ollama` into `ollama.corp.example.com` and reach off the box. That is a
+ * machine whose resolver its owner configured, which is a different threat model
+ * from an accidental paste — and anyone who disagrees has `allowRemoteEndpoint`
+ * to make the decision explicit in the other direction.
+ */
+export function isLocalEndpointHost(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/\.$/, '');
+  if (host.length === 0) return false;
+  if (host.startsWith('[') || host.includes(':')) return isPrivateIpv6(host);
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host.endsWith('.local') || host.endsWith('.internal')) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return isPrivateIpv4(host);
+  // Single-label name: unresolvable by public DNS, so it is somebody's local
+  // resolver answering. See the note above.
+  return !host.includes('.');
+}
+
+/**
+ * The single choke point. Every LLM call in the app builds its client here, so
+ * refusing a remote endpoint here refuses it everywhere — there is no second
+ * path to `fetch` that skips this.
+ */
+export function assertLocalLlmEndpoint(settings: LlmSettings): void {
+  if (settings.allowRemoteEndpoint) return;
+
+  let hostname: string;
+  try {
+    hostname = new URL(settings.baseUrl).hostname;
+  } catch {
+    throw new ConfigurationError(
+      `The LLM base URL is not a valid URL: ${settings.baseUrl}. Fix it under Settings → Local LLM.`,
+    );
+  }
+
+  if (isLocalEndpointHost(hostname)) return;
+
+  // The host is named, never the credentials or the rest of the URL.
+  throw new ConfigurationError(
+    `Refusing to send prompts to "${hostname}" — it is not on this machine or its private network. ` +
+      'Prompts contain your name, contact details, full resume and the job description. ' +
+      'Point Settings → Local LLM at a local endpoint, or, if you really intend to use a remote ' +
+      'one, turn on "Allow remote LLM endpoint" in the same section.',
+  );
+}
+
 export function createLlmClient(settings: LlmSettings): LlmClient {
+  assertLocalLlmEndpoint(settings);
   if (settings.provider === 'ollama') return new OllamaClient(settings);
   if (OPENAI_COMPATIBLE.includes(settings.provider)) {
     return new OpenAiCompatibleClient(settings, settings.provider);

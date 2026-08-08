@@ -3,8 +3,10 @@ import { ConfigurationError, NotFoundError, toErrorMessage } from '../core/error
 import type { EventBus } from '../core/events.js';
 import type { Logger } from '../core/logger.js';
 import { normalizeText, truncate } from '../core/utils.js';
+import { matchesAnyKeyword } from '../collectors/normalize.js';
 import type { BrowserManager } from '../browser/browser.manager.js';
 import type { ApplierRegistry } from '../browser/appliers/index.js';
+import { isPipelineStageEnabled } from '../queue/worker.js';
 import type {
   AnswerRequest,
   AnswerResult,
@@ -20,6 +22,7 @@ import type { CoverLetterRepository, ResumeRepository } from '../repositories/re
 import { describeProfile } from './job.service.js';
 import type { CoverLetterService, ResumeService } from './resume.service.js';
 import type { LlmService } from './llm/llm.service.js';
+import type { KeywordService } from './keyword.service.js';
 import type { NotificationService } from './notification.service.js';
 import type { SettingsService } from './settings.service.js';
 
@@ -43,6 +46,20 @@ export interface ApplyResult {
 /** Reason an application was not attempted; surfaced verbatim to the user. */
 export class RateLimitedError extends ConfigurationError {}
 
+/** The only fields the auto-apply keyword gate reads off a job row. */
+export interface AutoApplyCandidate {
+  id: number;
+  title: string;
+  source: string;
+  skills: string[] | null;
+}
+
+export interface AutoApplyEligibility {
+  eligible: boolean;
+  /** Null when eligible; otherwise a specific, actionable sentence. */
+  reason: string | null;
+}
+
 export class ApplicationService {
   constructor(
     private readonly applications: ApplicationRepository,
@@ -57,9 +74,81 @@ export class ApplicationService {
     private readonly llm: LlmService,
     private readonly settingsService: SettingsService,
     private readonly notifications: NotificationService,
+    private readonly keywords: KeywordService,
     private readonly logger: Logger,
     private readonly events: EventBus,
   ) {}
+
+  /**
+   * Whether the pipeline may spend an application on this job *by itself*.
+   *
+   * It lives here rather than in either caller because there are two places
+   * that queue `application.apply` automatically — the scheduler's `apply` task
+   * and the `job.score` handler, which re-derives the score criteria inline —
+   * and they have already drifted apart once. A gate implemented in only one of
+   * them leaks every auto-apply that comes through the other, so the predicate
+   * gets exactly one home, next to `assertWithinLimits`, the other policy that
+   * decides whether an application is allowed to happen at all.
+   *
+   * Manual applies never call this: asking for one posting by id is explicit
+   * intent and outranks the vocabulary.
+   */
+  autoApplyEligibility(job: AutoApplyCandidate): AutoApplyEligibility {
+    const mode = this.settingsService.get().application.keywordMatch;
+    if (mode === 'off') return { eligible: true, reason: null };
+
+    const keywords = this.keywords.activeFor(job.source);
+    // `matchesAnyKeyword` answers true for an empty list — the right default for
+    // a collector's own search results, and exactly wrong here. An empty active
+    // set means the user has nothing enabled that could ever match, so leaning
+    // on that return would turn the gate off silently at the moment it matters
+    // most. Refuse instead, and say which of the two empty cases it is.
+    if (keywords.length === 0) {
+      const anyEnabled = this.keywords.list().some((keyword) => keyword.enabled);
+      return {
+        eligible: false,
+        reason: anyEnabled
+          ? `no keyword is enabled for source "${job.source}"`
+          : 'no keywords are enabled at all',
+      };
+    }
+
+    if (matchesAnyKeyword(job.title, keywords)) return { eligible: true, reason: null };
+    if (mode === 'title') {
+      return { eligible: false, reason: 'title does not match any enabled keyword' };
+    }
+
+    // Skills are matched one at a time rather than joined: a joined string lets a
+    // phrase keyword straddle two unrelated skills ("data engineer" hitting
+    // "…data" + "engineering…").
+    const skills = job.skills ?? [];
+    if (skills.some((skill) => matchesAnyKeyword(skill, keywords))) {
+      return { eligible: true, reason: null };
+    }
+    return {
+      eligible: false,
+      reason: 'neither title nor extracted skills match any enabled keyword',
+    };
+  }
+
+  /**
+   * The gate plus its log line. Both automatic enqueue sites call this and
+   * nothing else, so a skip is impossible to make invisible by forgetting to
+   * log it at a new call site — silent stoppage is the failure mode users
+   * cannot debug.
+   */
+  allowsAutoApply(job: AutoApplyCandidate): boolean {
+    const { eligible, reason } = this.autoApplyEligibility(job);
+    if (!eligible) {
+      this.logger.info('auto-apply skipped by keyword gate', {
+        jobId: job.id,
+        title: job.title,
+        source: job.source,
+        reason,
+      });
+    }
+    return eligible;
+  }
 
   /** Enforces the daily and per-company caps configured in Settings. */
   private assertWithinLimits(company: string): void {
@@ -139,18 +228,59 @@ export class ApplicationService {
 
     // Prepare the documents before opening a browser so failures are cheap.
     let resumeId = request.resumeId ?? settings.application.defaultResumeId ?? null;
-    if ((request.tailorResume ?? settings.application.tailorResume) && (job.score ?? 0) >= settings.application.minScoreToTailor) {
-      try {
-        const tailored = await this.resumeService.tailorForJob({
+    // The request's flag outranks Settings; the stage switch outranks both,
+    // because stopping the tailor stage is how the user hands the CPU back and a
+    // manual apply spending two generations anyway would make that switch a lie.
+    // Read structurally off settings rather than through `PipelineService`: that
+    // service owns the worker, whose handlers own this service.
+    const tailoringEnabled =
+      (request.tailorResume ?? settings.application.tailorResume) &&
+      isPipelineStageEnabled(settings.pipeline, 'tailor');
+
+    if (tailoringEnabled) {
+      const minScore = settings.application.minScoreToTailor;
+      // A null score is not a low score. Treating it as zero meant an unscored
+      // job — one applied to straight from the dashboard, before the pipeline
+      // ever reached it — silently got the untailored base resume, with nothing
+      // in the log to say why. It still does, because tailoring against a job we
+      // have not read is guesswork; the difference is that it now says so.
+      if (job.score === null) {
+        logger.info('resume not tailored: the job has no score yet', {
           jobId: job.id,
-          baseResumeId: resumeId,
-          signal,
+          minScoreToTailor: minScore,
         });
-        resumeId = tailored.id;
-      } catch (error) {
-        logger.warn('resume tailoring failed; falling back to the base resume', {
-          error: toErrorMessage(error),
+      } else if (job.score < minScore) {
+        logger.info('resume not tailored: score is below the tailoring threshold', {
+          jobId: job.id,
+          score: job.score,
+          minScoreToTailor: minScore,
         });
+      } else {
+        try {
+          const tailored = await this.resumeService.tailorForJob({
+            jobId: job.id,
+            baseResumeId: resumeId,
+            signal,
+          });
+          // `renderDocuments` records a failed compile instead of throwing, so a
+          // tailored row can exist with no PDF at all. Adopting it anyway means
+          // the applier falls back to the DOCX rendered from the broken source —
+          // it uploads a mangled resume and reports success. The base document
+          // compiled, so it is strictly the better of the two.
+          if (tailored.compileOk) {
+            resumeId = tailored.id;
+          } else {
+            logger.warn('tailored resume did not compile; falling back to the base resume', {
+              jobId: job.id,
+              tailoredResumeId: tailored.id,
+              baseResumeId: resumeId,
+            });
+          }
+        } catch (error) {
+          logger.warn('resume tailoring failed; falling back to the base resume', {
+            error: toErrorMessage(error),
+          });
+        }
       }
     }
 
@@ -166,7 +296,10 @@ export class ApplicationService {
     let coverLetterId: number | null = null;
     let coverLetterText: string | null = null;
     let coverLetterPath: string | null = null;
-    if (request.generateCoverLetter ?? settings.application.generateCoverLetter) {
+    if (
+      (request.generateCoverLetter ?? settings.application.generateCoverLetter) &&
+      isPipelineStageEnabled(settings.pipeline, 'cover_letter')
+    ) {
       try {
         const letter = await this.coverLetterService.generate({
           jobId: job.id,

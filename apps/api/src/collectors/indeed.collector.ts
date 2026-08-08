@@ -1,4 +1,5 @@
 import type { Page } from 'playwright';
+import { resolveSessionStrategy, type Settings } from '@deedy/shared';
 import { canonicalUrl, sleep, stripHtml } from '../core/utils.js';
 import type { NormalizedJob } from '../repositories/job.repository.js';
 import {
@@ -57,8 +58,28 @@ export function isChallengePage(url: string, body: string, status?: number | nul
   return CHALLENGE_PATTERNS.some((pattern) => pattern.test(body));
 }
 
-const SESSION_FIX_HINT =
-  'Indeed is blocking this machine (it answers 403 to traffic it does not trust) or is serving a verification challenge. Fix: open Browser Sessions, paste a fresh Indeed session from a browser where you are already signed in on this network, and consider setting a country host such as "uk.indeed.com" under Settings → Search → Boards → indeed.';
+/**
+ * Which repair to advise depends entirely on the resolved session strategy:
+ * under `attended` there is already a visible window on this machine to sign in
+ * and clear the interstitial in, under `stored` there is not, and the only route
+ * back is pasting a session exported from another browser. Reading the raw
+ * `attended` switch instead would misadvise anyone who pinned a strategy - an
+ * open window is not the same thing as the session a run will actually use.
+ */
+const ATTENDED_SIGN_IN =
+  'open the Browser page and press Sign in for Indeed — a window is already open on this machine; log in there once and this collector will reuse the session';
+
+const BLOCK_SYMPTOM =
+  'Indeed is blocking this machine (it answers 403 to traffic it does not trust) or is serving a verification challenge.';
+
+const COUNTRY_HOST_TIP =
+  'consider setting a country host such as "uk.indeed.com" under Settings → Search → Boards → indeed';
+
+export function sessionFixHint(settings: Settings): string {
+  return resolveSessionStrategy(settings.browser) === 'attended'
+    ? `${BLOCK_SYMPTOM} Fix: ${ATTENDED_SIGN_IN}, clearing any verification in that same window, and ${COUNTRY_HOST_TIP}.`
+    : `${BLOCK_SYMPTOM} Fix: open Browser Sessions, paste a fresh Indeed session from a browser where you are already signed in on this network, and ${COUNTRY_HOST_TIP}.`;
+}
 
 /** A country host must still resolve to Indeed — a typo would otherwise send the session elsewhere. */
 const INDEED_HOST = /(^|\.)indeed\.[a-z]{2,3}(\.[a-z]{2})?$/i;
@@ -482,6 +503,9 @@ export const indeedCollector: CollectorDefinition = {
       : [''];
     const results: NormalizedJob[] = [];
     const seen = new Set<string>();
+    // Resolved once: the mode cannot change mid-run, and both warning sites
+    // below must give the same, mode-correct instruction.
+    const sessionHint = sessionFixHint(context.settings);
     let detailNavigation = true;
     /**
      * At most one rotation per run, and only for the search page. Moving the
@@ -554,7 +578,7 @@ export const indeedCollector: CollectorDefinition = {
               }
             }
             if (!loaded) {
-              context.logger.warn(SESSION_FIX_HINT, { url: searchUrl, keyword, location });
+              context.logger.warn(sessionHint, { url: searchUrl, keyword, location });
               return results;
             }
 
@@ -596,7 +620,7 @@ export const indeedCollector: CollectorDefinition = {
                   const opened = await gotoTolerantOfChallenge(page, applicationUrl, context);
                   if (!opened) {
                     detailNavigation = false;
-                    context.logger.warn(SESSION_FIX_HINT, { url: applicationUrl });
+                    context.logger.warn(sessionHint, { url: applicationUrl });
                   } else {
                     const html = await readDescriptionHtml(page);
                     if (html) {

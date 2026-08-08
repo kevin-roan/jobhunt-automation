@@ -7,18 +7,68 @@ services:
       target: runtime
     image: deedy-automation:latest
     container_name: deedy-app
+    # Pinned because Chromium records `<hostname>-<pid>` in the SingletonLock
+    # inside the persistent profile. Docker's default random hostname changes on
+    # every recreate, which makes each lock unreclaimable. BrowserManager
+    # deletes stale locks anyway; this keeps them recognisable in the meantime.
+    hostname: deedy-app
     # "no" (not unless-stopped) so Docker never resurrects this on host boot.
     # Start it deliberately with ./start.sh.
     restart: 'no'
     ports:
-      - '${APP_PORT:-8080}:8080'
+      # Loopback-bound, and kept that way even though /api now requires a bearer
+      # token. Defence in depth: the token is one shared secret in front of the
+      # candidate's resume, name, email and phone, the stored LLM prompts
+      # containing them, and a browser signed in to their job-board accounts.
+      # Widen APP_BIND only deliberately — and NEVER together with
+      # AUTH_ENABLED=false, which would leave nothing at all in the way.
+      - '${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080'
+      # noVNC: the attended browser's screen. Bound to loopback deliberately —
+      # anyone who can reach this port can drive a browser that is signed in to
+      # the user's LinkedIn and Indeed accounts. Override NOVNC_BIND only if you
+      # understand that, and set VNC_PASSWORD when you do.
+      - '${NOVNC_BIND:-127.0.0.1}:${NOVNC_PORT:-6080}:6080'
     environment:
       NODE_ENV: production
       DATA_DIR: /data
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # --- Attended browsing -------------------------------------------------
+      # The virtual screen the visible Chromium window is drawn on. Set
+      # VIRTUAL_DISPLAY=0 to run purely headless, as before.
+      VIRTUAL_DISPLAY: ${VIRTUAL_DISPLAY:-1}
+      SCREEN_GEOMETRY: ${SCREEN_GEOMETRY:-1920x1080x24}
+      VNC_PASSWORD: ${VNC_PASSWORD:-}
+      # Seeds browser.attended on first boot only; the dashboard is
+      # authoritative afterwards. On by default here because the image now ships
+      # a screen for it, which is the whole reason this feature was unusable in
+      # Docker before.
+      BROWSER_ATTENDED: ${BROWSER_ATTENDED:-true}
+      # Which session collectors use: the window you sign in to (`attended`) or
+      # a pasted cookie (`stored`). Pinned to attended here rather than left at
+      # `auto` because this image ships the screen that makes it work, so the
+      # credential vault is never read and nothing needs pasting.
+      BROWSER_SESSION_STRATEGY: ${BROWSER_SESSION_STRATEGY:-attended}
+      # Where the dashboard points its embedded viewer. It is loaded by the
+      # user's browser, not by the container, so it must be a host-reachable
+      # address rather than a container-internal one.
+      REMOTE_VIEW_URL: ${REMOTE_VIEW_URL:-http://localhost:${NOVNC_PORT:-6080}/vnc.html}
       # Reaches the Ollama service below, or the host with host.docker.internal.
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      # --- API authentication ------------------------------------------------
+      # Bearer token every /api route requires. Left empty the app generates one
+      # on first boot, stores it at /data/.api-token (mode 0600) and prints it
+      # at startup:
+      #
+      #   docker compose logs app | grep 'API token:'
+      #   docker compose exec app cat /data/.api-token
+      #
+      # Set it explicitly to pin a value that survives losing the volume.
+      API_TOKEN: ${API_TOKEN:-}
+      # The escape hatch, and it is off-by-default for a reason. Only set false
+      # when an authenticating proxy in front of this port is doing the job
+      # instead — never in combination with a widened APP_BIND.
+      AUTH_ENABLED: ${AUTH_ENABLED:-true}
       # Optional mobile companion. These seed the sync settings on first boot;
       # only operational metadata is mirrored, never documents or PII.
       SUPABASE_URL: ${SUPABASE_URL:-}
@@ -49,6 +99,9 @@ services:
     extra_hosts:
       - 'host.docker.internal:host-gateway'
     healthcheck:
+      # /api/health/live is exempt from the bearer token deliberately: this
+      # probe has no way to carry a secret, and the endpoint returns {"ok":true}
+      # and nothing else. Keep the path in sync with the Dockerfile HEALTHCHECK.
       test: ['CMD', 'curl', '-fsS', 'http://127.0.0.1:8080/api/health/live']
       interval: 30s
       timeout: 5s

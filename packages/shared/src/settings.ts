@@ -1,17 +1,33 @@
 import { z } from 'zod';
+import type { EffectiveSessionStrategy } from './enums.js';
 import {
   browserEngineSchema,
+  sessionStrategySchema,
   vpnBackendSchema,
   employmentTypeSchema,
   experienceLevelSchema,
+  keywordMatchModeSchema,
   llmProviderSchema,
   remoteTypeSchema,
 } from './enums.js';
 
 export const llmSettingsSchema = z.object({
   provider: llmProviderSchema.default('ollama'),
-  /** Base URL of the OpenAI-compatible / Ollama endpoint. Never leaves the host. */
+  /**
+   * Base URL of the OpenAI-compatible / Ollama endpoint.
+   *
+   * Being a valid URL is not the same as being a local one, and every prompt
+   * this app builds carries the candidate's name, email, phone, whole resume and
+   * the job description. `allowRemoteEndpoint` is what actually holds that
+   * promise — see `assertLocalLlmEndpoint` in `services/llm/providers.ts`.
+   */
   baseUrl: z.string().url().default('http://localhost:11434'),
+  /**
+   * Permit a base URL that is not demonstrably on this host or its private
+   * network. Off by default and deliberately awkward to turn on: flipping it
+   * means prompts containing full PII may be sent to a third party.
+   */
+  allowRemoteEndpoint: z.boolean().default(false),
   /** Optional bearer token for local gateways. Stored encrypted, masked in logs. */
   apiKey: z.string().default(''),
   /** Chosen by the user in Settings — never hardcoded anywhere in the codebase. */
@@ -83,13 +99,55 @@ export const vpnSettingsSchema = z.object({
    * by default and the endpoint is yours to choose.
    */
   verifyExitIp: z.boolean().default(false),
-  exitIpEndpoint: z.string().default('https://api.protonvpn.ch/vpn/location'),
+  /**
+   * Empty by default, and empty disables the check even when `verifyExitIp` is
+   * on. Shipping a third party's hostname as the default would have made this
+   * app contact them the moment someone flipped the switch, without ever having
+   * chosen them — in a product whose whole promise is that nothing leaves the
+   * host, that choice has to be typed out by hand.
+   */
+  exitIpEndpoint: z.string().default(''),
 });
 export type VpnSettings = z.infer<typeof vpnSettingsSchema>;
 
 export const browserSettingsSchema = z.object({
   engine: browserEngineSchema.default('chromium'),
   headless: z.boolean().default(true),
+  /**
+   * Attended mode: one visible Chromium window, shared by every provider, that
+   * stays open between runs.
+   *
+   * The point is to stop hand-feeding cookies. You sign in to LinkedIn or
+   * Indeed yourself, in that window, the way you would in any browser; the
+   * profile on disk keeps the session, and every collector and application run
+   * afterwards drives the same profile. Nothing has to be exported, pasted or
+   * decrypted, and the site sees an ordinary browser it has already challenged
+   * and cleared.
+   *
+   * It needs a graphical session on the host, so it is off by default and a
+   * headless deployment is unaffected.
+   */
+  attended: z.boolean().default(false),
+  /**
+   * Which session a collector or application run uses. See
+   * `SESSION_STRATEGIES`. Left at `auto` this follows `attended`, which is what
+   * that switch already implied; set it explicitly to pin the behaviour — most
+   * usefully `attended`, so a signed-in window is the single source of truth and
+   * a stale pasted cookie can never be replayed over it.
+   */
+  sessionStrategy: sessionStrategySchema.default('auto'),
+  /**
+   * Every provider shares one browser profile instead of getting its own.
+   * Implied by `attended` — a single visible window cannot be per-provider —
+   * but available on its own for a headless install that still wants one
+   * cookie jar.
+   */
+  sharedProfile: z.boolean().default(false),
+  /**
+   * Leave the window open when a run finishes. Off closes it after each run,
+   * which loses the point of signing in once.
+   */
+  keepAlive: z.boolean().default(true),
   /** Directory root for persistent profiles; one sub-directory per provider. */
   profileRoot: z.string().default('./data/browser-profiles'),
   slowMoMs: z.number().int().min(0).max(5000).default(0),
@@ -100,7 +158,18 @@ export const browserSettingsSchema = z.object({
   userAgent: z.string().default(''),
   locale: z.string().default('en-US'),
   timezone: z.string().default('UTC'),
+  /**
+   * Full-page screenshots of every application step.
+   *
+   * These are pixels of whatever was on screen, which on an application form is
+   * the candidate's typed name, email, phone and address, plus the signed-in
+   * chrome of the site. No scrubber can redact an image, so unlike the HTML
+   * snapshots below these are stored exactly as captured. They never leave the
+   * host, but they are the most sensitive thing in DATA_DIR. Turn this off if
+   * that is not a trade you want.
+   */
   captureScreenshots: z.boolean().default(true),
+  /** DOM snapshots. Field values and inline scripts are redacted before write. */
   captureHtml: z.boolean().default(true),
   /** Hard stop: never click submit, only prepare the application. */
   dryRun: z.boolean().default(true),
@@ -160,6 +229,21 @@ export const applicationSettingsSchema = z.object({
   tailorResume: z.boolean().default(true),
   /** Escalate to the Applications page instead of guessing an answer. */
   pauseOnUnknownQuestion: z.boolean().default(true),
+  /**
+   * How much of a posting an *automatic* apply has to recognise from the enabled
+   * search keywords before it is queued. A score is a model's opinion; this is
+   * the user's own vocabulary, so it acts as a hard gate on top of the score.
+   *
+   * `off` — no keyword test; score plus recommendation alone decide, which is
+   * exactly the behaviour that existed before this setting.
+   * `title` — the job title must contain an enabled keyword.
+   * `title_or_skills` — the title *or* one of the skills extracted from the
+   * posting must contain an enabled keyword. The default.
+   *
+   * Manual applies (the Apply and Retry buttons, and the phone's retry command)
+   * are never gated: asking for one posting by id is explicit intent.
+   */
+  keywordMatch: keywordMatchModeSchema.default('title_or_skills'),
 });
 export type ApplicationSettings = z.infer<typeof applicationSettingsSchema>;
 
@@ -233,11 +317,30 @@ export const profileSettingsSchema = z.object({
   linkedinUrl: z.string().default(''),
   githubUrl: z.string().default(''),
   portfolioUrl: z.string().default(''),
-  yearsOfExperience: z.number().min(0).max(60).default(0),
-  requiresSponsorship: z.boolean().default(false),
-  authorizedToWork: z.boolean().default(true),
-  willingToRelocate: z.boolean().default(false),
-  noticePeriodDays: z.number().int().min(0).max(365).default(0),
+  /**
+   * Null means "not set", and that distinction is load-bearing. The form filler
+   * only skips a field when the answer is empty, so a numeric default of 0 is
+   * indistinguishable from a real answer and gets typed into a live application
+   * as "0 years of experience". Null makes the filler escalate instead.
+   */
+  yearsOfExperience: z.number().min(0).max(60).nullable().default(null),
+  /**
+   * Null means "the candidate has not said", and that is why these are nullable
+   * rather than defaulted booleans.
+   *
+   * The form filler answers work-authorisation and sponsorship questions from
+   * these values, on a real application, under the candidate's name — they are
+   * legal declarations, not preferences. A `false`/`true` default would be
+   * indistinguishable from a deliberate answer, so an untouched install would
+   * confidently declare work authorisation nobody ever claimed. Null escalates
+   * to the human instead, which is the only safe default for a declaration.
+   */
+  requiresSponsorship: z.boolean().nullable().default(null),
+  authorizedToWork: z.boolean().nullable().default(null),
+  /** A preference rather than a declaration, but unset is still not "no". */
+  willingToRelocate: z.boolean().nullable().default(null),
+  /** Null means "not set" — see `yearsOfExperience`. 0 is a real notice period. */
+  noticePeriodDays: z.number().int().min(0).max(365).nullable().default(null),
   desiredSalary: z.number().min(0).nullable().default(null),
   summary: z.string().default(''),
 });
@@ -302,11 +405,47 @@ export const settingsPatchSchema = z
   .partial();
 export type SettingsPatch = z.infer<typeof settingsPatchSchema>;
 
-/** Dotted paths whose values must be encrypted at rest and masked in every log line. */
+/**
+ * Dotted paths whose values must be encrypted at rest and masked in every log
+ * line — and, since `GET /api/settings` returns them masked, in every response.
+ *
+ * Adding a path here has a second half that is easy to miss: the dashboard reads
+ * the mask and would write it straight back, overwriting the real value. Any
+ * path listed here must also be stripped-when-unchanged in `buildPatch` in
+ * `apps/web/src/pages/Settings.tsx`. Both are covered for everything below.
+ *
+ * `llm.baseUrl` is deliberately NOT here, though it can legally carry
+ * `https://user:pass@host`. Two reasons, either one sufficient:
+ *
+ *   1. It is the only field validated with `z.string().url()`, and
+ *      `SettingsService.update` runs `settingsSchema.parse` on the merged object
+ *      *before* the mask-means-unchanged filter gets a say. A mask is not a URL,
+ *      so any client that round-trips the redacted payload — a curl PATCH, a
+ *      test, a future client that does not replicate `buildPatch` — would fail
+ *      the whole save. That is a strictly worse failure than the leak it fixes.
+ *   2. Masking it would hide from the user the one value that says where their
+ *      prompts are going, which is exactly what `allowRemoteEndpoint` exists to
+ *      make visible. Redacting the evidence and guarding the behaviour are not
+ *      the same trade.
+ *
+ * Credentials embedded in the base URL are instead handled where they matter:
+ * the endpoint guard refuses non-local hosts outright, and the redactor keeps
+ * URL userinfo out of logs.
+ */
 export const SECRET_SETTING_PATHS = [
   'llm.apiKey',
   'notifications.webhookUrl',
   'sync.secretKey',
+  // Routinely carry `--username x --password y` on the command line.
+  'vpn.connectCommand',
+  'vpn.disconnectCommand',
+  'vpn.statusCommand',
+  // Together these identify and address the user's sync project. The
+  // publishable key is only as safe as row level security, and the URL plus
+  // user id are enough to fingerprint the account.
+  'sync.url',
+  'sync.publishableKey',
+  'sync.userId',
 ] as const;
 
 export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({
@@ -322,3 +461,24 @@ export const DEFAULT_SETTINGS: Settings = settingsSchema.parse({
   profile: {},
   sync: {},
 });
+
+/**
+ * Resolves `auto` into the strategy the run path actually branches on.
+ *
+ * Kept here, in shared, so the API and the dashboard can never disagree about
+ * which session a run is going to use — the answer is shown in the UI and acted
+ * on by `BrowserManager`, and those drifting apart is precisely the kind of bug
+ * that costs someone a day.
+ *
+ * `auto` follows `attended` because that switch already meant "there is a window
+ * I sign in to myself"; an explicit value overrides it, including the
+ * deliberately awkward combination of attended mode ON with `stored` chosen,
+ * which is legitimate when someone wants the visible window for debugging but
+ * still wants the pasted cookie to be authoritative.
+ */
+export function resolveSessionStrategy(
+  browser: Pick<BrowserSettings, 'attended' | 'sessionStrategy'>,
+): EffectiveSessionStrategy {
+  if (browser.sessionStrategy !== 'auto') return browser.sessionStrategy;
+  return browser.attended ? 'attended' : 'stored';
+}

@@ -6,10 +6,12 @@ import type {
   ArtifactDto,
   AssistResumeResult,
   BrowserSessionDto,
+  BrowserSessionStatus,
   CollectorDto,
   CollectorRunDto,
   CompileResumeResult,
   CoverLetterDto,
+  EffectiveSessionStrategy,
   ExpandKeywordsResult,
   HealthPayload,
   JobDto,
@@ -53,6 +55,77 @@ export class ApiError extends Error {
 
 const BASE = '/api';
 
+/* -------------------------------------------------------------------------- */
+/* Bearer token                                                                */
+/* -------------------------------------------------------------------------- */
+
+const TOKEN_STORAGE_KEY = 'deedy.apiToken';
+
+/**
+ * `localStorage`, not a cookie. A cookie would be attached by the browser to
+ * every same-origin request automatically, which is exactly what makes CSRF
+ * possible; a header this module sets by hand cannot be forged by another page.
+ */
+function readStoredToken(): string | null {
+  try {
+    const stored = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+    return stored !== null && stored.length > 0 ? stored : null;
+  } catch {
+    // Private-mode or a blocked storage partition. The gate simply asks again.
+    return null;
+  }
+}
+
+let apiToken: string | null = readStoredToken();
+
+const unauthorizedListeners = new Set<() => void>();
+
+/**
+ * URL of the live event stream, token included.
+ *
+ * `let`, and reassigned by `setApiToken`, because `EventSource` cannot send an
+ * Authorization header — the browser opens that socket itself. ESM live
+ * bindings mean `lib/events.ts` reads the current value when its effect runs,
+ * which is always after the gate has stored a token.
+ */
+export let eventsUrl = '';
+
+function withToken(url: string): string {
+  if (apiToken === null) return url;
+  return `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(apiToken)}`;
+}
+
+function refreshTokenisedUrls(): void {
+  eventsUrl = withToken(`${BASE}/events`);
+}
+
+refreshTokenisedUrls();
+
+export function getApiToken(): string | null {
+  return apiToken;
+}
+
+/** Stores (or clears) the token and re-points every URL that carries it inline. */
+export function setApiToken(token: string | null): void {
+  apiToken = token !== null && token.length > 0 ? token : null;
+  try {
+    if (apiToken === null) window.localStorage.removeItem(TOKEN_STORAGE_KEY);
+    else window.localStorage.setItem(TOKEN_STORAGE_KEY, apiToken);
+  } catch {
+    // Storage unavailable: the token still works for this page's lifetime.
+  }
+  refreshTokenisedUrls();
+}
+
+/**
+ * Fires when the server rejects the stored token. The gate re-renders instead
+ * of leaving the dashboard showing empty panels with no explanation.
+ */
+export function onUnauthorized(listener: () => void): () => void {
+  unauthorizedListeners.add(listener);
+  return () => unauthorizedListeners.delete(listener);
+}
+
 type QueryValue = string | number | boolean | null | undefined;
 
 function buildQuery(params: Record<string, QueryValue> = {}): string {
@@ -70,11 +143,19 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: {
       ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...(apiToken !== null ? { authorization: `Bearer ${apiToken}` } : {}),
       ...(init.headers ?? {}),
     },
   });
 
   if (!response.ok) {
+    // A rejected token is never transient, so keeping it would just produce a
+    // dashboard full of failing panels. Drop it and let the gate ask again.
+    if (response.status === 401) {
+      setApiToken(null);
+      for (const listener of unauthorizedListeners) listener();
+    }
+
     let message = `Request failed with ${response.status}`;
     let code = 'request_failed';
     let details: unknown;
@@ -136,7 +217,19 @@ export interface SaveCredentialResult extends ProviderCredentialDto {
 /** Result of replaying a stored session against the provider. Never echoes the secret. */
 export interface CredentialVerifyResult {
   provider: string;
+  /**
+   * Whether the pasted vault session still works. It only answers that
+   * question: under the `attended` strategy a provider with nothing pasted
+   * comes back false because there is nothing in the vault to judge, not
+   * because a session broke. Always read it together with `strategy`.
+   */
   valid: boolean;
+  /**
+   * Which session a run would actually use. `attended` plus `valid: false`
+   * means "not vault-backed, ask the browser-session check instead", never
+   * "invalid".
+   */
+  strategy: EffectiveSessionStrategy;
   message: string | null;
   checkedAt: string;
 }
@@ -164,6 +257,16 @@ export interface QueueStats {
 /** Typed client for every endpoint the dashboard uses. */
 export const api = {
   health: (): Promise<HealthPayload> => request('/health'),
+
+  /**
+   * The token gate. `status` is the one endpoint served without a token — it
+   * only reports whether this instance wants one. `check` is gated, so a 200
+   * from it IS the verification.
+   */
+  auth: {
+    status: (): Promise<{ authRequired: boolean }> => request('/auth/status'),
+    check: (): Promise<{ ok: true }> => request('/auth/check'),
+  },
 
   settings: {
     get: (): Promise<Settings> => request('/settings'),
@@ -266,7 +369,9 @@ export const api = {
       body: { latex: string; theme?: ResumeTheme },
       signal?: AbortSignal,
     ): Promise<CompileResumeResult> => post('/resumes/compile', body, signal),
-    previewUrl: (previewId: string): string => `${BASE}/resumes/preview/${previewId}`,
+    // Loaded by the browser (an <object>/<a>), which cannot attach a header —
+    // hence the inline token. See `withToken`.
+    previewUrl: (previewId: string): string => withToken(`${BASE}/resumes/preview/${previewId}`),
     /** Free-text editing: "make it one page", "target this job", "warmer palette". */
     assist: (
       id: number,
@@ -279,7 +384,7 @@ export const api = {
       post(`/resumes/${id}/tailor`, body),
     /** `txt` is the derived plain-text mirror — what an ATS parser sees. */
     downloadUrl: (id: number, format: 'pdf' | 'docx' | 'txt' | 'tex'): string =>
-      `${BASE}/resumes/${id}/download?format=${format}`,
+      withToken(`${BASE}/resumes/${id}/download?format=${format}`),
   },
 
   /**
@@ -394,6 +499,24 @@ export const api = {
       post(`/collectors/${collectorId}/run`, { immediate }),
   },
 
+  /**
+   * The attended browser: one visible window you sign in to yourself, which
+   * every collector then reuses. Replaces pasting cookies.
+   */
+  browser: {
+    status: (): Promise<BrowserSessionStatus> => request('/browser/session'),
+    open: (): Promise<BrowserSessionStatus> =>
+      post('/browser/session/control', { action: 'open' }),
+    close: (): Promise<BrowserSessionStatus> =>
+      post('/browser/session/control', { action: 'close' }),
+    /** Opens a login tab for a provider and brings the window forward. */
+    signIn: (provider: string, url?: string): Promise<BrowserSessionStatus> =>
+      post('/browser/session/control', { action: 'signin', provider, url }),
+    /** Re-probes whether a provider is signed in right now. */
+    check: (provider?: string): Promise<BrowserSessionStatus> =>
+      post('/browser/session/control', { action: 'check', provider }),
+  },
+
   browserSessions: {
     list: (): Promise<{ sessions: BrowserSessionDto[]; open: string[] }> =>
       request('/browser-sessions'),
@@ -443,7 +566,7 @@ export const api = {
         createdAt: string;
       }[];
     }> => request(`/artifacts/screenshots${buildQuery({ limit })}`),
-    artifactUrl: (id: number): string => `${BASE}/artifacts/${id}/file`,
+    artifactUrl: (id: number): string => withToken(`${BASE}/artifacts/${id}/file`),
   },
 
   analytics: {
@@ -498,5 +621,3 @@ export const api = {
     pair: (userId: string): Promise<SyncStatus> => post('/sync/pair', { userId }),
   },
 };
-
-export const eventsUrl = `${BASE}/events`;

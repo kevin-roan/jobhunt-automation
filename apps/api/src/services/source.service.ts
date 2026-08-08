@@ -1,16 +1,39 @@
-import type { QueueJobDto, SourceStatusDto } from '@deedy/shared';
+import {
+  resolveSessionStrategy,
+  type EffectiveSessionStrategy,
+  type QueueJobDto,
+  type SourceStatusDto,
+} from '@deedy/shared';
 import type { BrowserManager } from '../browser/browser.manager.js';
 import type { CollectorRegistry } from '../collectors/registry.js';
 import { NotFoundError } from '../core/errors.js';
 import type { Logger } from '../core/logger.js';
 import type { AnalyticsRepository } from '../repositories/analytics.repository.js';
-import type { CollectorRunRepository } from '../repositories/browser.repository.js';
+import type {
+  BrowserSessionRepository,
+  CollectorRunRepository,
+} from '../repositories/browser.repository.js';
+import type { BrowserSessionRow } from '../db/schema.js';
 import type { QueueRepository } from '../repositories/queue.repository.js';
 import { REQUIRED_COOKIES, type CredentialService } from './credential.service.js';
 import type { SettingsService } from './settings.service.js';
 
 /** Enough to cover every collect job the queue can realistically hold at once. */
 const QUEUE_SCAN_PAGE_SIZE = 200;
+
+/**
+ * "unknown" is not "signed out": a profile that has never been probed has no
+ * evidence either way, and telling the user to sign in when they may already be
+ * signed in is exactly the wrong advice.
+ */
+type SignInState = 'in' | 'out' | 'unknown';
+
+function probedSignIn(row: BrowserSessionRow | undefined): SignInState {
+  // `lastCheckAt` is the timestamp the probe writes alongside `loggedIn`, so a
+  // row created by `ensure()` and never checked still reads as unknown.
+  if (!row || row.lastCheckAt === null) return 'unknown';
+  return row.loggedIn ? 'in' : 'out';
+}
 
 /** The collect job payload the worker and the run route both enqueue. */
 function collectorIdOf(job: QueueJobDto): string | null {
@@ -35,6 +58,10 @@ export class SourceService {
     private readonly analytics: AnalyticsRepository,
     private readonly queue: QueueRepository,
     private readonly browser: BrowserManager,
+    // Attended mode keeps the session in the browser profile rather than the
+    // credential vault, so the probed sign-in state is the only truthful source
+    // for "can this collector actually run?".
+    private readonly browserSessions: BrowserSessionRepository,
     private readonly logger: Logger,
   ) {}
 
@@ -53,10 +80,18 @@ export class SourceService {
         .enabled(settings.search.enabledCollectors, settings.search.boards)
         .map((collector) => collector.id),
     );
+    // Resolved once for the whole list: every tile has to agree about which
+    // session a run would use, and re-deriving it per source invites drift.
+    const strategy = resolveSessionStrategy(settings.browser);
     const jobStats = this.analytics.perSourceJobStats();
     const lastRuns = this.collectorRuns.latestByCollector();
     const running = this.runningCollectorIds();
     const openProviders = new Set(this.browser.openProviders());
+    // One read for the whole list: a query per source would scale with the
+    // registry (built-ins plus plugins).
+    const probedSessions = new Map(
+      this.browserSessions.list().map((row) => [row.provider, row]),
+    );
 
     return this.registry.all().map((collector) => {
       const boards = settings.search.boards[collector.source] ?? [];
@@ -67,8 +102,14 @@ export class SourceService {
           ? settings.search.enabledCollectors.includes(collector.id)
           : planned.has(collector.id);
 
-      // The DTO carries status only — the credential value never leaves the vault.
-      const stored = collector.requiresAuth ? this.credentials.get(collector.source) : undefined;
+      // The DTO carries status only - the credential value never leaves the vault.
+      //
+      // Under the attended strategy the vault is not consulted by the run path
+      // at all, so reporting a row from it would put a status on the tile that
+      // nothing acts on: a stale "expired" beside a window that is signed in
+      // and collecting fine. No lookup, no credential, no false alarm.
+      const usesVault = collector.requiresAuth && strategy === 'stored';
+      const stored = usesVault ? this.credentials.get(collector.source) : undefined;
       const credential = stored
         ? {
             status: stored.status,
@@ -115,11 +156,14 @@ export class SourceService {
         activeKeywords,
         blockedReason: this.blockedReason({
           source: collector.source,
+          sourceName: collector.name,
           requiresAuth: collector.requiresAuth,
           requiresBoards: collector.requiresBoards,
           boards,
           credentialStatus: credential?.status ?? null,
           hasCredential: credential !== null,
+          strategy,
+          signedIn: probedSignIn(probedSessions.get(collector.source)),
           activeKeywords,
         }),
       };
@@ -196,11 +240,14 @@ export class SourceService {
    */
   private blockedReason(input: {
     source: string;
+    sourceName: string;
     requiresAuth: boolean;
     requiresBoards: boolean;
     boards: string[];
     credentialStatus: string | null;
     hasCredential: boolean;
+    strategy: EffectiveSessionStrategy;
+    signedIn: SignInState;
     activeKeywords: number;
   }): string | null {
     if (input.activeKeywords === 0) {
@@ -208,6 +255,18 @@ export class SourceService {
     }
     if (input.requiresBoards && input.boards.length === 0) {
       return `No company boards configured. Add slugs under Settings → Search → Boards → ${input.source}.`;
+    }
+    if (input.requiresAuth && input.strategy === 'attended') {
+      // Under the attended strategy the session lives in the shared browser
+      // profile, not in the credential vault, so a source with no stored
+      // credential is routinely working perfectly. Judging it by the vault
+      // would show a false "No session saved" blocker; the probe is the only
+      // honest signal.
+      if (input.signedIn === 'in') return null;
+      if (input.signedIn === 'out') {
+        return `Not signed in to ${input.sourceName}. Open the Browser page and press Sign in; the window is already open.`;
+      }
+      return 'Sign-in state unknown. Open the Browser page and press Re-check.';
     }
     if (input.requiresAuth && !input.hasCredential) {
       return 'No session saved. Paste a signed-in session under Browser Sessions.';

@@ -25,8 +25,48 @@ export interface FormField {
   required: boolean;
   options: string[];
   currentValue: string;
-  /** True when a checkbox/radio group is a consent or acknowledgement gate. */
+  /** True when a checkbox is a benign acknowledgement gate — see `classifyConsentText`. */
   isConsent: boolean;
+  /** True when the field is a personal declaration the candidate must make themselves. */
+  isAttestation: boolean;
+}
+
+/**
+ * Wording that turns a field into a declaration made under the candidate's own
+ * name — a certification of truthfulness, an eligibility attestation, or a
+ * signature. Ticking one of these is the candidate saying something about
+ * themselves that an employer (and sometimes a court) may rely on, so it is
+ * always escalated to the human, never inferred.
+ *
+ * The line is drawn at the verbs that carry legal weight — certify, attest,
+ * declare, affirm, swear, penalty of perjury — plus explicit signature widgets
+ * and any "… is true / accurate / correct / complete" formulation. Deliberately
+ * NOT included: "agree", "acknowledge", "consent", "confirm" on their own. Those
+ * words carry every cookie banner and terms-of-service tick on the web, and
+ * escalating them would halt essentially every application.
+ *
+ * `certify` is matched only as the bare verb: "certification"/"certified" appear
+ * in ordinary skills questions ("Are you AWS certified?") that must not escalate.
+ */
+const ATTESTATION_PATTERN =
+  /\b(certify|certifying|attest|attests|attesting|attestation|declare|declares|declaring|declaration|affirm|affirms|swear|perjury)\b|\bunder penalt|\b(e-?signature|signature|signed below|sign here|initials)\b|\b(information|statements?|answers?|details?|responses?)\b[^.]{0,80}\b(true|accurate|correct|complete|truthful)\b/;
+
+/**
+ * Wording that makes a checkbox a benign acknowledgement — privacy policies,
+ * terms, cookie/GDPR notices, marketing opt-ins. These are auto-ticked because
+ * refusing them just blocks the application without protecting anyone.
+ */
+const BENIGN_CONSENT_PATTERN =
+  /\b(consent|agree|agreement|acknowledge|acknowledgement|privacy|terms|conditions|gdpr|ccpa|policy|policies|cookies?|data protection|processing|newsletter|marketing|subscribe|updates|opt[\s-]?in|opt[\s-]?out)\b/;
+
+/**
+ * Splits acknowledgement wording from declaration wording. Attestation always
+ * wins: "I agree that the information provided is true" is an agreement in
+ * grammar and a sworn statement in substance.
+ */
+export function classifyConsentText(text: string): { isConsent: boolean; isAttestation: boolean } {
+  const isAttestation = ATTESTATION_PATTERN.test(text);
+  return { isAttestation, isConsent: !isAttestation && BENIGN_CONSENT_PATTERN.test(text) };
 }
 
 const PROFILE_MATCHERS: { pattern: RegExp; field: keyof ProfileSettings }[] = [
@@ -47,14 +87,77 @@ const PROFILE_MATCHERS: { pattern: RegExp; field: keyof ProfileSettings }[] = [
   { pattern: /\b(notice period)\b/, field: 'noticePeriodDays' },
 ];
 
-const YES_NO_MATCHERS: { pattern: RegExp; resolve: (profile: ProfileSettings) => boolean }[] = [
+/**
+ * Jurisdictions we can recognise on both sides of a work-authorization question.
+ * Deliberately short: an unrecognised country on either side means "no opinion",
+ * which leaves the pre-existing behaviour untouched rather than inventing a
+ * mismatch out of a string we do not understand.
+ */
+const JURISDICTIONS: { code: string; pattern: RegExp }[] = [
+  { code: 'us', pattern: /\b(united states|u\.s\.a?\.?|usa|america)\b/ },
+  { code: 'ca', pattern: /\bcanada\b/ },
+  { code: 'gb', pattern: /\b(united kingdom|u\.k\.|uk|great britain|britain|england|scotland|wales)\b/ },
+  { code: 'ie', pattern: /\bireland\b/ },
+  { code: 'de', pattern: /\bgermany|deutschland\b/ },
+  { code: 'fr', pattern: /\bfrance\b/ },
+  { code: 'nl', pattern: /\b(netherlands|holland)\b/ },
+  { code: 'es', pattern: /\bspain\b/ },
+  { code: 'it', pattern: /\bitaly\b/ },
+  { code: 'au', pattern: /\baustralia\b/ },
+  { code: 'nz', pattern: /\bnew zealand\b/ },
+  { code: 'in', pattern: /\bindia\b/ },
+  { code: 'sg', pattern: /\bsingapore\b/ },
+  { code: 'ae', pattern: /\b(united arab emirates|u\.a\.e\.?|uae)\b/ },
+  { code: 'eu', pattern: /\b(european union|eu|eea|schengen)\b/ },
+];
+
+const EU_MEMBERS = new Set(['ie', 'de', 'fr', 'nl', 'es', 'it']);
+
+function detectJurisdiction(text: string): string | null {
+  return JURISDICTIONS.find((entry) => entry.pattern.test(text))?.code ?? null;
+}
+
+/**
+ * True when the question asks about a country the candidate's profile does not
+ * describe. "Are you authorized to work in the United States?" answered from a
+ * flag set by someone living in India is a legal declaration about the wrong
+ * jurisdiction, and a wrong one is worse than an escalation.
+ */
+function jurisdictionConflict(haystack: string, profile: ProfileSettings): boolean {
+  const asked = detectJurisdiction(haystack);
+  const home = detectJurisdiction(normalizeText(profile.country));
+  if (!asked || !home || asked === home) return false;
+  if (asked === 'eu' && EU_MEMBERS.has(home)) return false;
+  if (home === 'eu' && EU_MEMBERS.has(asked)) return false;
+  return true;
+}
+
+/**
+ * `resolve` returns null for "the candidate never stated this", which the caller
+ * turns into an escalation.
+ *
+ * Today `requiresSponsorship`, `authorizedToWork` and `willingToRelocate` are
+ * non-nullable booleans with schema defaults, so a default is indistinguishable
+ * from a deliberate answer and null is unreachable for them — the nullable
+ * return type is what lets `packages/shared/src/settings.ts` make those three
+ * `.nullable().default(null)` (the way `yearsOfExperience` already is) without a
+ * single change here. `jurisdictional` marks the two that are legal
+ * declarations about a specific country.
+ */
+const YES_NO_MATCHERS: {
+  pattern: RegExp;
+  resolve: (profile: ProfileSettings) => boolean | null;
+  jurisdictional?: boolean;
+}[] = [
   {
     pattern: /\b(require|need).{0,30}(sponsorship|visa)\b|\bsponsorship\b.{0,20}\brequire/,
     resolve: (profile) => profile.requiresSponsorship,
+    jurisdictional: true,
   },
   {
     pattern: /\b(legally )?(authorized|authorised|eligible).{0,30}(work|employment)\b/,
     resolve: (profile) => profile.authorizedToWork,
+    jurisdictional: true,
   },
   {
     pattern: /\b(willing|able).{0,20}(relocate|relocation)\b/,
@@ -72,7 +175,25 @@ const YES_NO_MATCHERS: { pattern: RegExp; resolve: (profile: ProfileSettings) =>
  * generation on the Node side.
  */
 export async function scanFields(target: Page | Frame): Promise<FormField[]> {
-  return target.evaluate(() => {
+  // The callback is serialised into the page, so the classification patterns have
+  // to travel as source strings rather than as the compiled regexes above.
+  const patterns = {
+    attestation: ATTESTATION_PATTERN.source,
+    consent: BENIGN_CONSENT_PATTERN.source,
+  };
+
+  return target.evaluate((sources: { attestation: string; consent: string }) => {
+    const attestationPattern = new RegExp(sources.attestation, 'i');
+    const consentPattern = new RegExp(sources.consent, 'i');
+
+    // Attributes from a previous scan would otherwise linger on elements this
+    // scan skips (hidden, removed from the flow, or now inside a closed step),
+    // and `[data-deedy-field="N"]` would match two elements — a Playwright
+    // strict-mode violation that silently drops the field.
+    document
+      .querySelectorAll('[data-deedy-field]')
+      .forEach((element) => element.removeAttribute('data-deedy-field'));
+
     const kindOf = (element: Element): string => {
       if (element.tagName === 'TEXTAREA') return 'textarea';
       if (element.tagName === 'SELECT') return 'select';
@@ -146,6 +267,7 @@ export async function scanFields(target: Page | Frame): Promise<FormField[]> {
       options: string[];
       currentValue: string;
       isConsent: boolean;
+      isAttestation: boolean;
     }[] = [];
     const seenRadioGroups = new Set<string>();
 
@@ -185,22 +307,44 @@ export async function scanFields(target: Page | Frame): Promise<FormField[]> {
           element.getAttribute('aria-required') === 'true' ||
           /\*/.test(label),
         options,
+        // A radio group answers as a group: the entry stands for every radio
+        // sharing the name, so "No" being selected has to read as answered, not
+        // as an empty first radio.
         currentValue:
-          kind === 'checkbox' || kind === 'radio'
-            ? String((element as HTMLInputElement).checked)
-            : ((element as HTMLInputElement).value ?? ''),
+          kind === 'radio' && name
+            ? String(
+                Array.from(
+                  document.querySelectorAll<HTMLInputElement>(
+                    `input[type="radio"][name="${CSS.escape(name)}"]`,
+                  ),
+                ).some((radio) => radio.checked),
+              )
+            : kind === 'checkbox' || kind === 'radio'
+              ? String((element as HTMLInputElement).checked)
+              : ((element as HTMLInputElement).value ?? ''),
+        // Attestation wins over consent — see `classifyConsentText`.
         isConsent:
-          kind === 'checkbox' &&
-          /consent|agree|acknowledge|privacy|terms|gdpr|policy|certify/i.test(label),
+          kind === 'checkbox' && !attestationPattern.test(label) && consentPattern.test(label),
+        isAttestation: attestationPattern.test(label),
       });
     });
 
     return fields;
-  }) as unknown as Promise<FormField[]>;
+  }, patterns) as unknown as Promise<FormField[]>;
 }
 
 export function fieldSelector(field: FormField): string {
   return `[data-deedy-field="${field.index}"]`;
+}
+
+/**
+ * True when the field still has no answer. Checkboxes and radio groups carry the
+ * strings 'true'/'false', and 'false' is truthy — reading `currentValue` directly
+ * counts every unticked required box as answered.
+ */
+export function isFieldEmpty(field: FormField): boolean {
+  if (field.kind === 'checkbox' || field.kind === 'radio') return field.currentValue !== 'true';
+  return field.currentValue.trim() === '';
 }
 
 export interface ResolvedAnswer {
@@ -217,10 +361,18 @@ export function resolveFromProfile(
   const haystack = normalizeText(`${field.label} ${field.name} ${field.placeholder}`);
   if (!haystack) return null;
 
+  // No declaration is ever made on the candidate's behalf. The flag is recomputed
+  // from the full haystack rather than trusted, so a field built by hand — or one
+  // whose signature wording lives in the name attribute — is covered too.
+  if (field.isAttestation || classifyConsentText(haystack).isAttestation) return null;
+
   if (field.kind === 'select' || field.kind === 'radio') {
     for (const matcher of YES_NO_MATCHERS) {
       if (!matcher.pattern.test(haystack)) continue;
-      const wanted = matcher.resolve(profile) ? 'yes' : 'no';
+      const stated = matcher.resolve(profile);
+      if (stated === null) return null;
+      if (matcher.jurisdictional && jurisdictionConflict(haystack, profile)) return null;
+      const wanted = stated ? 'yes' : 'no';
       const option = field.options.find((opt) => normalizeText(opt).startsWith(wanted));
       if (option) return { value: option, source: 'profile', confidence: 0.9 };
     }
@@ -230,9 +382,11 @@ export function resolveFromProfile(
   if (field.kind === 'checkbox') {
     if (field.isConsent) return { value: 'true', source: 'profile', confidence: 0.95 };
     for (const matcher of YES_NO_MATCHERS) {
-      if (matcher.pattern.test(haystack)) {
-        return { value: String(matcher.resolve(profile)), source: 'profile', confidence: 0.85 };
-      }
+      if (!matcher.pattern.test(haystack)) continue;
+      const stated = matcher.resolve(profile);
+      if (stated === null) return null;
+      if (matcher.jurisdictional && jurisdictionConflict(haystack, profile)) return null;
+      return { value: String(stated), source: 'profile', confidence: 0.85 };
     }
     return null;
   }

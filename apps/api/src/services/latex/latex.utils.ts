@@ -265,6 +265,219 @@ export function findUnsafeConstruct(latex: string): string | null {
   return null;
 }
 
+/**
+ * The sections whose content is the candidate's evidence rather than their
+ * pitch. Tailoring may rewrite the summary and reshuffle the skills rows; it may
+ * not touch anything matched here. Matched on the `\section{...}` heading, so a
+ * document that calls it "Professional Experience" or "Selected Projects" is
+ * still protected.
+ */
+const PROTECTED_SECTION = /\b(experience|employment|work\s*history|projects?|portfolio)\b/i;
+
+/**
+ * Which protected bucket a heading belongs to. Comparing on the bucket rather
+ * than on the heading text lets a model retitle "Experience" to "Professional
+ * Experience" — pure presentation — while still catching an entry that moved
+ * from the projects section into the work history, which is a claim about
+ * employment that the base document never made.
+ */
+function protectedSectionKind(heading: string): 'experience' | 'projects' | null {
+  if (!PROTECTED_SECTION.test(heading)) return null;
+  return /\b(projects?|portfolio)\b/i.test(heading) ? 'projects' : 'experience';
+}
+
+/** The macros that carry an entry's identity: who, what role, and when. */
+const ENTRY_MACROS = ['runsubsection', 'descript', 'location'] as const;
+
+export interface ProtectedEntry {
+  /** Which protected block the entry was found in, regardless of the heading's wording. */
+  section: 'experience' | 'projects';
+  /** `entry` for an employer/project/date line, `bullet` for a `\item` claim. */
+  kind: 'entry' | 'bullet';
+  /** Normalised prose, for comparison. */
+  text: string;
+}
+
+/**
+ * Comparison form for one fragment of resume evidence. Two documents that say
+ * the same thing must produce the same string here, or a re-indent would read as
+ * a falsified employer; two that say different things must not, or the guard is
+ * decorative.
+ *
+ * Macro expansion runs first so `\custombold{Acme}` and plain `Acme` agree, and
+ * `\href{url}{label}` compares on the label the reader actually sees.
+ */
+function normalizeEntryText(raw: string): string {
+  return expandMacros(raw)
+    .replace(/~/g, ' ')
+    // Every dash the class or a model might use for a date range is the same dash.
+    .replace(/[‐-―]|--+/g, '-')
+    .replace(/[‘’]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/\s+/g, ' ')
+    // Trailing punctuation is typography, not a claim.
+    .replace(/[\s.,;:|-]+$/, '')
+    .replace(/^[\s.,;:|-]+/, '')
+    .trim()
+    .toLowerCase();
+}
+
+/** The document body, with comments removed — a `%` hides its line from the engine. */
+function documentBody(latex: string): string {
+  const text = latex.replace(/\r\n/g, '\n').replace(/(^|[^\\])%.*$/gm, '$1');
+  const begin = text.indexOf('\\begin{document}');
+  const end = text.lastIndexOf('\\end{document}');
+  if (begin < 0) return end > 0 ? text.slice(0, end) : text;
+  return text.slice(begin + '\\begin{document}'.length, end > begin ? end : undefined);
+}
+
+/** Every `\section{...}` in the body, paired with the text that runs up to the next one. */
+function splitSections(body: string): { heading: string; content: string }[] {
+  const marker = /\\section\*?\s*\{/g;
+  const sections: { heading: string; content: string }[] = [];
+  const starts: { heading: string; from: number }[] = [];
+
+  for (let match = marker.exec(body); match; match = marker.exec(body)) {
+    const group = readGroup(body, match.index + match[0].length - 1);
+    if (!group) continue;
+    starts.push({ heading: normalizeEntryText(group.body), from: group.end });
+    marker.lastIndex = group.end;
+  }
+
+  for (let i = 0; i < starts.length; i++) {
+    const start = starts[i]!;
+    const next = starts[i + 1];
+    // The next heading's content begins at its own `\section` token, which sits
+    // before the recorded `from`; slicing to the group start is close enough
+    // because a heading contributes no entries of its own.
+    const until = next ? body.lastIndexOf('\\section', next.from) : body.length;
+    sections.push({ heading: start.heading, content: body.slice(start.from, until) });
+  }
+
+  return sections;
+}
+
+/** The `\item` bullets inside one section, each running to the next item or list end. */
+function extractBullets(content: string): string[] {
+  const bullets: string[] = [];
+  const marker = /\\item\b/g;
+
+  for (let match = marker.exec(content); match; match = marker.exec(content)) {
+    const from = match.index + match[0].length;
+    const stop = content.slice(from).search(/\\item\b|\\end\s*\{|\\section\b|\\entryline\b/);
+    bullets.push(content.slice(from, stop < 0 ? content.length : from + stop));
+  }
+
+  return bullets;
+}
+
+/**
+ * The candidate's evidence, as comparable fragments: every employer, role, date
+ * and project identity line, plus every bullet claimed under them.
+ *
+ * Order is preserved but is not itself compared by `findPreservationBreach` —
+ * see there for why.
+ */
+export function extractProtectedEntries(latex: string): ProtectedEntry[] {
+  const entries: ProtectedEntry[] = [];
+
+  for (const { heading, content } of splitSections(documentBody(latex))) {
+    const section = protectedSectionKind(heading);
+    if (!section) continue;
+
+    for (const macro of ENTRY_MACROS) {
+      const marker = new RegExp(`\\\\${macro}\\s*\\{`, 'g');
+      for (let match = marker.exec(content); match; match = marker.exec(content)) {
+        const group = readGroup(content, match.index + match[0].length - 1);
+        if (!group) continue;
+        marker.lastIndex = group.end;
+        const text = normalizeEntryText(group.body);
+        if (text) entries.push({ section, kind: 'entry', text });
+      }
+    }
+
+    for (const bullet of extractBullets(content)) {
+      const text = normalizeEntryText(bullet);
+      if (text) entries.push({ section, kind: 'bullet', text });
+    }
+  }
+
+  return entries;
+}
+
+/** `section|kind|text`, the key the two documents' evidence is matched on. */
+function entryKey(entry: ProtectedEntry): string {
+  return `${entry.section}|${entry.kind}|${entry.text}`;
+}
+
+export interface PreservationBreach {
+  /** Evidence present in the base document that the tailored one no longer states. */
+  missing: ProtectedEntry[];
+  /** Evidence the tailored document states that the base never did. */
+  invented: ProtectedEntry[];
+  /** One line naming the breach, for the rejection log. */
+  reason: string;
+}
+
+/**
+ * Compares the protected evidence of a tailored document against its base.
+ * Returns null when the tailoring is legitimate — that is, when it only touched
+ * the summary and the skills rows.
+ *
+ * Compared as multisets rather than as sequences: a model that re-emits the same
+ * entries in a different order has still told the truth, and rejecting that
+ * would train the fallback to fire on every generation. A dropped, altered or
+ * invented entry changes the multiset and is caught.
+ *
+ * Everything is normalised first (macro expansion, whitespace, dashes, escaped
+ * literals, case), so re-indenting an entry or writing `\custombold{Acme}` for
+ * `Acme` is not a breach, while renaming the employer is.
+ */
+export function findPreservationBreach(
+  baseLatex: string,
+  tailoredLatex: string,
+): PreservationBreach | null {
+  const base = extractProtectedEntries(baseLatex);
+  // A base with no protected sections has no evidence to protect; anything the
+  // model returns is, by construction, not a falsification of it.
+  if (base.length === 0) return null;
+
+  const remaining = new Map<string, ProtectedEntry[]>();
+  for (const entry of extractProtectedEntries(tailoredLatex)) {
+    const bucket = remaining.get(entryKey(entry));
+    if (bucket) bucket.push(entry);
+    else remaining.set(entryKey(entry), [entry]);
+  }
+
+  const missing: ProtectedEntry[] = [];
+  for (const entry of base) {
+    const bucket = remaining.get(entryKey(entry));
+    if (bucket && bucket.length > 0) bucket.pop();
+    else missing.push(entry);
+  }
+
+  const invented = [...remaining.values()].flat();
+  if (missing.length === 0 && invented.length === 0) return null;
+
+  const describe = (entry: ProtectedEntry): string =>
+    `${entry.section}/${entry.kind}: "${truncateEntry(entry.text)}"`;
+  const parts: string[] = [];
+  if (missing.length > 0) {
+    parts.push(`${missing.length} dropped or altered (${missing.map(describe).join('; ')})`);
+  }
+  if (invented.length > 0) {
+    parts.push(`${invented.length} added or reworded (${invented.map(describe).join('; ')})`);
+  }
+
+  return { missing, invented, reason: `protected sections changed — ${parts.join(', ')}` };
+}
+
+const ENTRY_LOG_CHARS = 80;
+
+function truncateEntry(text: string): string {
+  return text.length > ENTRY_LOG_CHARS ? `${text.slice(0, ENTRY_LOG_CHARS)}…` : text;
+}
+
 interface Group {
   body: string;
   end: number;

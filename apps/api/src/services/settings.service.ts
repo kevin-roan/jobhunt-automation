@@ -113,19 +113,43 @@ export class SettingsService {
     const merged = deepMerge(DEFAULT_SETTINGS as unknown as PlainObject, target);
     const parsed = settingsSchema.safeParse(merged);
     if (!parsed.success) {
-      this.logger.warn('stored settings failed validation, falling back to defaults for invalid keys', {
-        issues: parsed.error.issues.slice(0, 10),
-      });
+      // The cache is filled BEFORE anything is logged. A log line is scrubbed by
+      // the process-wide redactor, the redactor reads its rules from this very
+      // service, and an unfilled cache would send that read straight back into
+      // this branch — an unbounded recursion the moment a stored value goes bad.
       this.cache = settingsSchema.parse(
         deepMerge(DEFAULT_SETTINGS as unknown as PlainObject, {}),
       );
+      // Path and code only. A Zod issue can carry the offending value, and the
+      // offending value here is a settings value — which for `profile.*` is the
+      // candidate's name, email or postcode. The `logs` table is read back over
+      // an unauthenticated port, so nothing personal is put into it to begin
+      // with; the path already says everything needed to fix the row.
+      this.logger.warn('stored settings failed validation, falling back to defaults for invalid keys', {
+        issues: parsed.error.issues
+          .slice(0, 10)
+          .map((issue) => ({ path: issue.path.join('.'), code: issue.code })),
+      });
       return this.cache;
     }
     this.cache = parsed.data;
     return this.cache;
   }
 
-  /** Settings safe to send to the browser: secrets replaced with a mask. */
+  /**
+   * Settings safe to send to the browser: secrets replaced with a mask.
+   *
+   * `profile.*` is deliberately NOT masked, even though it is the most personal
+   * data in the file. The Settings screen is the only place the profile can be
+   * edited and it saves the section back verbatim, so a mask sent out on read
+   * would be written back on the next save and the user's real email and phone
+   * would be destroyed — a mask is only survivable for a value the form knows to
+   * strip, which today is exactly `SECRET_SETTING_PATHS`. Masking here would
+   * also not buy the confidentiality it appears to: this endpoint is
+   * unauthenticated, and the same caller can read the profile back out of the
+   * job/application payloads regardless. The real fix for that is authentication
+   * plus keeping the port bound to loopback, not a mask on one response.
+   */
   getRedacted(): Settings {
     const settings = structuredClone(this.get()) as unknown as PlainObject;
     for (const path of SECRET_PATHS) {

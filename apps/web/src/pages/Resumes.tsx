@@ -5,6 +5,7 @@ import {
   ChevronDown,
   ChevronRight,
   Download,
+  ExternalLink,
   FileText,
   Pencil,
   Plus,
@@ -49,6 +50,9 @@ import {
   TabsTrigger,
 } from '@/components/ui/overlays';
 import { useToast } from '@/components/ui/toast';
+
+/** Loaded on demand — see the note on the component itself. */
+const PdfPreview = React.lazy(() => import('@/components/PdfPreview'));
 
 /* -------------------------------------------------------------------------- */
 /* Theme helpers                                                               */
@@ -585,11 +589,24 @@ function ResumeEditorDialog({
                       showing last good PDF
                     </Badge>
                   ) : null}
+                  {compile.previewId !== null ? (
+                    // Always available, even when in-page rendering works: some
+                    // users just want the PDF at full size in their own viewer.
+                    <a
+                      href={api.resumes.previewUrl(compile.previewId)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="ml-auto inline-flex items-center gap-1.5 text-[11px] text-muted-foreground underline underline-offset-2 transition-colors hover:text-foreground"
+                    >
+                      <ExternalLink className="size-3.5" />
+                      Open PDF in a new tab
+                    </a>
+                  ) : null}
                   <Button
                     type="button"
                     variant="outline"
                     size="sm"
-                    className="ml-auto"
+                    className={compile.previewId === null ? 'ml-auto' : undefined}
                     disabled={compile.status === 'pending' || !latex.trim() || engineMissing}
                     onClick={() => {
                       if (values.theme) void runCompile(values.latex, values.theme);
@@ -610,12 +627,19 @@ function ResumeEditorDialog({
 
                 <div className="min-h-0 flex-1 overflow-hidden rounded-md border border-border bg-background">
                   {compile.previewId !== null ? (
-                    <iframe
-                      key={compile.previewId}
-                      src={api.resumes.previewUrl(compile.previewId)}
-                      title="Compiled resume PDF preview"
-                      className="size-full"
-                    />
+                    <React.Suspense
+                      fallback={
+                        <div className="flex h-full min-h-[16rem] items-center justify-center p-6 text-xs text-muted-foreground">
+                          Loading the PDF renderer…
+                        </div>
+                      }
+                    >
+                      <PdfPreview
+                        key={compile.previewId}
+                        url={api.resumes.previewUrl(compile.previewId)}
+                        className="size-full"
+                      />
+                    </React.Suspense>
                   ) : (
                     <div className="flex h-full min-h-[16rem] items-center justify-center p-6 text-center text-xs text-muted-foreground">
                       {engineMissing

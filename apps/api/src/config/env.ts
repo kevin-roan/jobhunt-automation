@@ -30,6 +30,57 @@ const envSchema = z.object({
   ENCRYPTION_KEY: z.string().optional(),
 
   /**
+   * Bearer token every `/api/*` request must present. Generated on first boot
+   * and stored beside the encryption key when unset, exactly like it.
+   */
+  API_TOKEN: z.string().optional(),
+
+  /**
+   * Escape hatch for an install that already has an authenticating proxy in
+   * front of the port. Defaults ON — this API serves the candidate's resume,
+   * name, email, phone and every stored prompt containing them, so "no auth"
+   * has to be a deliberate act rather than the state you land in by omission.
+   */
+  AUTH_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => !(v === 'false' || v === '0')),
+
+  /**
+   * Seeds `browser.attended` on first boot. The container image ships a virtual
+   * screen (see docker/entrypoint.sh), so attended browsing works there and is
+   * turned on by default; a bare-metal install leaves it off because it would
+   * pop a window on the user's desktop unasked. Only ever seeds — once the key
+   * exists the dashboard is authoritative.
+   */
+  BROWSER_ATTENDED: z
+    .string()
+    .default('')
+    .transform((v) => (v === '' ? undefined : v === 'true' || v === '1')),
+
+  /**
+   * Seeds `browser.sessionStrategy` on first boot: which session a run uses,
+   * the signed-in window (`attended`) or a pasted cookie (`stored`). `auto`
+   * follows `BROWSER_ATTENDED`. Only ever seeds; the dashboard is authoritative
+   * once the key exists.
+   */
+  BROWSER_SESSION_STRATEGY: z
+    .enum(['auto', 'attended', 'stored', ''])
+    .default('')
+    .transform((v) => (v === '' ? undefined : v)),
+
+  /**
+   * URL of a viewer for the screen the attended browser is drawn on — noVNC in
+   * the container image. Empty on a desktop install, where the window is simply
+   * on the user's own screen and needs no viewer.
+   *
+   * This is loaded by the user's browser, not by the API, so it has to be an
+   * address reachable from the host (`http://localhost:6080/...`), not a
+   * container-internal one.
+   */
+  REMOTE_VIEW_URL: z.string().default(''),
+
+  /**
    * Optional Supabase project for the mobile companion app. These seed the
    * `sync` settings on first boot; the user can change them in the dashboard
    * afterwards. Only operational metadata is ever mirrored there.
@@ -55,11 +106,14 @@ export interface AppPaths {
   backups: string;
   plugins: string;
   keyFile: string;
+  tokenFile: string;
 }
 
 export interface AppConfig extends RawEnv {
   paths: AppPaths;
   encryptionKey: Buffer;
+  /** The bearer token `/api/*` requires. Always populated, even when auth is off. */
+  apiToken: string;
   version: string;
 }
 
@@ -88,11 +142,16 @@ export function loadConfig(overrides: NodeJS.ProcessEnv = process.env): AppConfi
     backups: ensureDir(path.join(root, 'backups')),
     plugins: ensureDir(path.join(root, 'plugins')),
     keyFile: path.join(root, '.encryption-key'),
+    tokenFile: path.join(root, '.api-token'),
   };
 
   const encryptionKey = resolveEncryptionKey(env.ENCRYPTION_KEY, paths.keyFile);
+  // Resolved even when AUTH_ENABLED is false, so flipping auth back on does not
+  // hand the user a different token than the one already in their password
+  // manager — and so the file is there to read if they lose the startup log.
+  const apiToken = resolveApiToken(env.API_TOKEN, paths.tokenFile);
 
-  return { ...env, paths, encryptionKey, version: '1.0.0' };
+  return { ...env, paths, encryptionKey, apiToken, version: '1.0.0' };
 }
 
 function resolveEncryptionKey(fromEnv: string | undefined, keyFile: string): Buffer {
@@ -111,6 +170,38 @@ function resolveEncryptionKey(fromEnv: string | undefined, keyFile: string): Buf
   writeFileSync(keyFile, generated.toString('hex'), { mode: 0o600 });
   return generated;
 }
+
+/**
+ * Loads or generates the bearer token, following `resolveEncryptionKey`: an
+ * explicit env value wins, otherwise the file in DATA_DIR, otherwise a fresh
+ * secret written there with mode 0600.
+ *
+ * base64url rather than hex, for two reasons: 32 bytes fit in 43 characters
+ * instead of 64, and every character is URL-safe — the browser cannot attach a
+ * header to an `<img>`, an `<a download>` or an `EventSource`, so this value
+ * also travels as a `?token=` query parameter on those three paths.
+ */
+function resolveApiToken(fromEnv: string | undefined, tokenFile: string): string {
+  if (fromEnv && fromEnv.trim().length > 0) {
+    const token = fromEnv.trim();
+    // A short token is worse than no token: it reads as protection while being
+    // guessable by anything that can spend a second on the port.
+    if (token.length < MIN_API_TOKEN_LENGTH) {
+      throw new Error(`API_TOKEN must be at least ${MIN_API_TOKEN_LENGTH} characters`);
+    }
+    return token;
+  }
+  if (existsSync(tokenFile)) {
+    const stored = readFileSync(tokenFile, 'utf8').trim();
+    if (stored.length >= MIN_API_TOKEN_LENGTH) return stored;
+  }
+  const generated = randomBytes(32).toString('base64url');
+  writeFileSync(tokenFile, generated, { mode: 0o600 });
+  return generated;
+}
+
+/** Long enough that online guessing is hopeless; short enough to retype once. */
+const MIN_API_TOKEN_LENGTH = 16;
 
 export function corsOrigins(config: AppConfig): string[] {
   return config.CORS_ORIGINS.split(',')

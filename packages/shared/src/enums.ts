@@ -242,6 +242,48 @@ export const VPN_BACKENDS = ['none', 'protonvpn', 'nmcli', 'wg_quick', 'command'
 export const vpnBackendSchema = z.enum(VPN_BACKENDS);
 export type VpnBackend = z.infer<typeof vpnBackendSchema>;
 
+/**
+ * Where a signed-in session comes from when a collector or an application run
+ * needs one.
+ *
+ * `attended` — the shared browser profile the user signed in to by hand, in the
+ * visible window (on their desktop, or over noVNC in the container). The
+ * profile IS the session; the credential vault is not consulted at all, so a
+ * source with nothing pasted is still perfectly able to run.
+ *
+ * `stored` — the classic path: a session the user exported from their own
+ * browser and pasted in, injected as cookies into a per-provider profile. Works
+ * headlessly and without a screen, at the cost of re-pasting whenever it
+ * expires.
+ *
+ * `auto` — follow `browser.attended`: use the attended profile when attended
+ * mode is on, the vault when it is off. The default, because it is what the two
+ * switches already implied before this setting existed.
+ */
+export const SESSION_STRATEGIES = ['auto', 'attended', 'stored'] as const;
+export const sessionStrategySchema = z.enum(SESSION_STRATEGIES);
+export type SessionStrategy = z.infer<typeof sessionStrategySchema>;
+
+/** `auto` resolved away — what the run path actually branches on. */
+export type EffectiveSessionStrategy = Exclude<SessionStrategy, 'auto'>;
+
+/**
+ * How much of a posting the auto-apply keyword gate has to recognise before the
+ * pipeline is allowed to spend an application on it.
+ *
+ * `off` — no keyword test at all; selection is score plus recommendation, the
+ * behaviour that existed before the gate.
+ *
+ * `title` — the job title alone must contain an enabled keyword. Strictest, and
+ * the one that keeps a high-scoring adjacent role out.
+ *
+ * `title_or_skills` — the title, or any skill extracted from the posting, must
+ * contain an enabled keyword.
+ */
+export const KEYWORD_MATCH_MODES = ['off', 'title', 'title_or_skills'] as const;
+export const keywordMatchModeSchema = z.enum(KEYWORD_MATCH_MODES);
+export type KeywordMatchMode = z.infer<typeof keywordMatchModeSchema>;
+
 export const BROWSER_ENGINES = ['chromium', 'chrome', 'firefox'] as const;
 export const browserEngineSchema = z.enum(BROWSER_ENGINES);
 export type BrowserEngine = z.infer<typeof browserEngineSchema>;

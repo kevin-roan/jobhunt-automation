@@ -31,6 +31,7 @@ import type { SyncStatus, SyncedApplicationRow, SyncedJobRow } from '@deedy/shar
 import type { EventBus } from '../../core/events.js';
 import type { Logger } from '../../core/logger.js';
 import { toErrorMessage } from '../../core/errors.js';
+import { installRedactionSource, Redactor } from '../../core/redact.js';
 import { nowIso, truncate } from '../../core/utils.js';
 import type { NotificationRow } from '../../db/schema.js';
 import type { ApplicationRepository } from '../../repositories/application.repository.js';
@@ -179,32 +180,6 @@ const LIMITS = {
   notificationBody: 1000,
 } as const;
 
-const REDACTED = '[REDACTED]';
-
-/**
- * Below this length a secret is too likely to collide with an ordinary word or
- * number to strip blindly. Real emails, phone numbers and keys are far longer.
- */
-const MIN_REDACTABLE_LENGTH = 5;
-
-/** Never operationally useful in a status string, and always personal data. */
-const EMAIL_PATTERN = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/**
- * A purely numeric secret (a postal code) needs digit boundaries, otherwise it
- * would also match inside an unrelated number such as a timeout in ms.
- */
-function secretPattern(secret: string): RegExp {
-  const body = escapeRegExp(secret);
-  return /^\d+$/.test(secret)
-    ? new RegExp(`(?<!\\d)${body}(?!\\d)`, 'g')
-    : new RegExp(body, 'gi');
-}
-
 export interface FlushResult {
   pushed: number;
   failed: number;
@@ -220,7 +195,23 @@ export class SyncService {
     private readonly settingsService: SettingsService,
     private readonly logger: Logger,
     private readonly events: EventBus,
-  ) {}
+  ) {
+    this.redactor = new Redactor(settingsService);
+    // The composition root builds the logger before any service exists, so this
+    // is the earliest point at which the process-wide scrubber can be told the
+    // candidate's actual values. Until now it has been running on the generic
+    // email and phone patterns alone.
+    installRedactionSource(settingsService);
+  }
+
+  /**
+   * Free text authored deep in the pipeline can quote whatever it was working
+   * with at the time: a Playwright failure names the element it was filling, an
+   * upstream error echoes the request that produced it. Truncation alone is no
+   * defence - the leak would be in the first few characters, so every value the
+   * host knows to be personal is stripped before the string reaches the wire.
+   */
+  private readonly redactor: Redactor;
 
   /** Built per call so a settings change takes effect without a restart. */
   private client(): SupabaseRestClient | null {
@@ -399,37 +390,6 @@ export class SyncService {
     return { pushed, failed };
   }
 
-  /**
-   * Free text authored deep in the pipeline can quote whatever it was working
-   * with at the time: a Playwright failure names the element it was filling, an
-   * upstream error echoes the request that produced it. Truncation alone is no
-   * defence - the leak would be in the first few characters. So every value the
-   * host knows to be personal or secret is stripped by exact match before the
-   * string is allowed onto the wire, and any email address goes with it.
-   *
-   * Exact-match only, and only for values of real length: a generic phone or
-   * address heuristic would shred ISO timestamps and error codes, and a mangled
-   * failure reason on the phone is a support cost with no privacy gain.
-   */
-  private redact(value: string): string {
-    const settings = this.settingsService.get();
-    const secrets = [
-      settings.profile.fullName,
-      settings.profile.email,
-      settings.profile.phone,
-      settings.profile.postalCode,
-      settings.llm.apiKey,
-      settings.sync.secretKey,
-    ];
-    let out = value;
-    for (const secret of secrets) {
-      const trimmed = secret.trim();
-      if (trimmed.length < MIN_REDACTABLE_LENGTH) continue;
-      out = out.replace(secretPattern(trimmed), REDACTED);
-    }
-    return out.replace(EMAIL_PATTERN, REDACTED);
-  }
-
   private toJobRow(jobId: number, userId: string): SyncedJobRow | null {
     const job = this.jobs.byId(jobId);
     if (!job) return null;
@@ -476,7 +436,7 @@ export class SyncService {
       error:
         application.error === null
           ? null
-          : truncate(this.redact(application.error), LIMITS.applicationError),
+          : truncate(this.redactor.text(application.error), LIMITS.applicationError),
       dry_run: application.dryRun,
       started_at: application.startedAt,
       submitted_at: application.submittedAt,
@@ -495,8 +455,8 @@ export class SyncService {
       level: notification.level,
       // Bodies are composed from metadata, but a collector or system alert can
       // embed an upstream error verbatim, so both fields go through the scrub.
-      title: truncate(this.redact(notification.title), LIMITS.notificationTitle),
-      body: truncate(this.redact(notification.body), LIMITS.notificationBody),
+      title: truncate(this.redactor.text(notification.title), LIMITS.notificationTitle),
+      body: truncate(this.redactor.text(notification.body), LIMITS.notificationBody),
       entity_type: notification.entityType,
       entity_id: notification.entityId,
       read: notification.read,

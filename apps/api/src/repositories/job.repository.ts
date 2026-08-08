@@ -248,7 +248,15 @@ export class JobRepository {
       .all();
   }
 
-  /** Scored jobs recommended for application that have no application row yet. */
+  /**
+   * Scored, unarchived jobs the model recommended applying to, best score first.
+   *
+   * It does NOT exclude jobs that already have an application row — nothing here
+   * joins `applications`. The `application.apply` dedupe key and
+   * `ApplicationRepository.ensure` are what keep a re-queued job from applying
+   * twice; a job still sitting at status `scored` after an attempt is meant to
+   * come back through here.
+   */
   readyToApply(minScore: number, limit: number): JobRow[] {
     return this.db
       .select()

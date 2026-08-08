@@ -1,16 +1,27 @@
 import { pino, type Logger as PinoLogger } from 'pino';
 import type { LogLevel } from '@deedy/shared';
 import type Database from 'better-sqlite3';
+import { REDACTED, redactText } from './redact.js';
 
 const SECRET_KEY_PATTERN = /(api[-_]?key|password|passwd|secret|token|authorization|cookie)/i;
-const REDACTED = '[REDACTED]';
 
-/** Recursively masks any value whose key looks like a credential. */
+/**
+ * Masks credentials by key name AND personal data by value.
+ *
+ * The key-name test alone was never enough: it only fires when whoever wrote
+ * the call site happened to name the field `token` or `cookie`, so an email
+ * under `assignee`, or a resume excerpt under `preview`, went to stdout and
+ * into the `logs` table untouched. Every string leaf therefore also goes
+ * through the value scrubber, which is what actually enforces "nothing leaves
+ * the host" for the observability copies.
+ */
 export function maskContext(value: unknown, depth = 0): unknown {
   if (depth > 6) return '[depth-limit]';
   if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return redactText(value);
   if (Array.isArray(value)) return value.map((v) => maskContext(v, depth + 1));
-  if (value instanceof Error) return { name: value.name, message: value.message };
+  // An Error's message routinely quotes the input that produced it.
+  if (value instanceof Error) return { name: value.name, message: redactText(value.message) };
   if (typeof value === 'object') {
     const out: Record<string, unknown> = {};
     for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
@@ -120,13 +131,17 @@ export class AppLogger implements Logger {
     if (LEVEL_ORDER[level] < LEVEL_ORDER[this.options.level]) return;
     const merged = { ...this.base, ...(context ?? {}) };
     const masked = maskContext(merged) as Record<string, unknown>;
+    // Messages are format strings written by hand, but they interpolate: several
+    // call sites already embed an error, a URL or an answer. Scrubbed once, here,
+    // so stdout and the `logs` table can never disagree about what was written.
+    const safeMessage = redactText(message);
 
-    this.pinoLogger[level]({ ...masked, scope: this.scope }, message);
+    this.pinoLogger[level]({ ...masked, scope: this.scope }, safeMessage);
 
     const entry: PersistedLog = {
       level,
       scope: this.scope,
-      message,
+      message: safeMessage,
       context: Object.keys(masked).length > 0 ? masked : null,
       createdAt: new Date().toISOString(),
     };

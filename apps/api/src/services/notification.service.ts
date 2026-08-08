@@ -1,5 +1,6 @@
 import type { NotificationDto, NotificationKind, NotificationLevel } from '@deedy/shared';
 import type { Logger } from '../core/logger.js';
+import { REDACTED, Redactor } from '../core/redact.js';
 import { dayKey, nowIso } from '../core/utils.js';
 import type { NotificationRepository } from '../repositories/notification.repository.js';
 import type { SettingsService } from './settings.service.js';
@@ -40,6 +41,112 @@ export interface NotificationSyncSink {
 }
 
 /**
+ * Hostnames that are local by convention rather than by address: mDNS names,
+ * the container/VM suffixes the usual self-hosted stacks hand out, and the
+ * reserved `.home.arpa` for residential networks.
+ */
+const LOCAL_HOST_SUFFIXES = ['.local', '.localhost', '.internal', '.lan', '.home.arpa'] as const;
+
+function isLocalIpv4(host: string): boolean {
+  const parts = host.split('.');
+  if (parts.length !== 4) return false;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return false;
+    const octet = Number(part);
+    if (octet > 255) return false;
+    octets.push(octet);
+  }
+  const [a, b] = octets as [number, number, number, number];
+  if (a === 127 || a === 0) return true; // loopback, and "this host"
+  if (a === 10) return true; // RFC1918
+  if (a === 192 && b === 168) return true; // RFC1918
+  if (a === 172 && b >= 16 && b <= 31) return true; // RFC1918
+  if (a === 169 && b === 254) return true; // link-local
+  return false;
+}
+
+function isLocalIpv6(host: string): boolean {
+  const address = host.toLowerCase();
+  if (address === '::1' || address === '::') return true;
+  // IPv4-mapped (`::ffff:127.0.0.1`) is still an IPv4 destination — but `URL`
+  // has already rewritten the dotted tail into hextets (`::ffff:7f00:1`) by the
+  // time we see it, so the hex form is the one that has to be understood.
+  const mapped = address.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/);
+  if (mapped) {
+    const high = Number.parseInt(mapped[1] as string, 16);
+    const low = Number.parseInt(mapped[2] as string, 16);
+    return isLocalIpv4(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
+  }
+  const dotted = address.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  if (dotted) return isLocalIpv4(dotted[1] as string);
+  if (/^f[cd]/.test(address)) return true; // fc00::/7, unique local
+  if (/^fe[89ab]/.test(address)) return true; // fe80::/10, link-local
+  return false;
+}
+
+/**
+ * Whether a URL's host is somewhere on this machine or this LAN.
+ *
+ * A bare, dot-less hostname counts as local on purpose: this project's own
+ * compose file addresses sibling containers by service name (`http://ntfy:8080`)
+ * and there is no such thing as a single-label name on the public internet, so
+ * rejecting them would break the intended deployment while blocking nothing.
+ */
+function isLocalWebhookHost(hostname: string): boolean {
+  // `URL.hostname` keeps the brackets around an IPv6 literal.
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if (host.length === 0) return false;
+  if (host === 'localhost') return true;
+  if (host.includes(':')) return isLocalIpv6(host);
+  if (/^\d/.test(host) && /^[\d.]+$/.test(host)) return isLocalIpv4(host);
+  if (!host.includes('.')) return true;
+  return LOCAL_HOST_SUFFIXES.some((suffix) => host.endsWith(suffix));
+}
+
+/**
+ * Resolves the configured webhook, or explains why it will not be used.
+ *
+ * The setting has always been documented as a local-only webhook but nothing
+ * enforced it, so a typo — or a copied-in ntfy.sh URL — silently shipped job
+ * titles and failure text off the machine. Enforcement is a hard restriction to
+ * private destinations rather than an opt-in flag: an opt-in would mean a new
+ * settings key, and "nothing leaves this host" is a property of the product, not
+ * a preference. Exported so it can be tested directly.
+ */
+export function resolveWebhookTarget(raw: string): { url: string } | { error: string } {
+  const trimmed = raw.trim();
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return { error: `notifications.webhookUrl is not a valid URL` };
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return { error: `notifications.webhookUrl must be http or https, got ${parsed.protocol}` };
+  }
+  if (!isLocalWebhookHost(parsed.hostname)) {
+    return {
+      error:
+        `notifications.webhookUrl points at ${parsed.hostname}, which is not on this host or LAN. ` +
+        `Notifications quote job titles and error text, so only loopback, private (RFC1918), ` +
+        `link-local or single-label/.local hosts are allowed.`,
+    };
+  }
+  return { url: parsed.toString() };
+}
+
+/** Deep enough for the shapes a caller realistically passes; guards cycles. */
+const MAX_DATA_DEPTH = 4;
+
+/**
+ * Mirrors the key-name rule in `maskContext`: a value under a key that names a
+ * credential is dropped outright rather than scrubbed, because the value
+ * scrubber only knows the two secrets the host has stored.
+ */
+const SECRET_KEY_PATTERN = /(api[-_]?key|password|passwd|secret|token|authorization|cookie)/i;
+
+/**
  * Durable notification feed plus an optional push to a user-supplied local
  * webhook (ntfy, gotify, Home Assistant…). The row in SQLite is the source of
  * truth so the dashboard and phone have something to read; the webhook is a
@@ -51,7 +158,19 @@ export class NotificationService {
     private readonly settingsService: SettingsService,
     private readonly logger: Logger,
     private readonly sync?: NotificationSyncSink,
-  ) {}
+  ) {
+    this.redactor = new Redactor(settingsService);
+  }
+
+  /**
+   * The webhook is the one notification sink that is a network call, and its
+   * strings are assembled from whatever failed deep in the pipeline: a
+   * Playwright error names the field it was filling and quotes the value, an ATS
+   * echoes the address it rejected. The SQLite row keeps the real text — the
+   * dashboard exists to show the user what happened — and only the copy that
+   * crosses a socket is scrubbed.
+   */
+  private readonly redactor: Redactor;
 
   /** Low-level entry point: persist first, then push. */
   async record(input: NotificationRecordInput): Promise<NotificationDto | undefined> {
@@ -199,18 +318,57 @@ export class NotificationService {
     }
   }
 
+  /** Every value that is about to be serialised, with the PII taken out. */
+  private scrubValue(value: unknown, depth: number): unknown {
+    if (depth > MAX_DATA_DEPTH) return '[depth-limit]';
+    if (value === null || value === undefined) return value;
+    if (typeof value === 'string') return this.redactor.text(value);
+    if (typeof value === 'number' || typeof value === 'boolean') return value;
+    if (Array.isArray(value)) return value.map((item) => this.scrubValue(item, depth + 1));
+    if (value instanceof Error) return this.redactor.text(value.message);
+    if (typeof value === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        out[key] = SECRET_KEY_PATTERN.test(key) ? REDACTED : this.scrubValue(val, depth + 1);
+      }
+      return out;
+    }
+    // A function, symbol or bigint has no place on the wire; name it, don't send it.
+    return `[${typeof value}]`;
+  }
+
+  private scrub(payload: NotificationPayload): NotificationPayload {
+    return {
+      title: this.redactor.text(payload.title),
+      message: this.redactor.text(payload.message),
+      level: payload.level,
+      data:
+        payload.data === undefined
+          ? undefined
+          : (this.scrubValue(payload.data, 0) as Record<string, unknown>),
+    };
+  }
+
   private async sendWebhook(payload: NotificationPayload): Promise<void> {
     const settings = this.settingsService.get().notifications;
     if (!settings.enabled || !settings.webhookUrl.trim()) return;
+
+    const target = resolveWebhookTarget(settings.webhookUrl);
+    if ('error' in target) {
+      // Refusing is the whole point, so this is an error rather than a warning —
+      // but it still must not break the pipeline that raised the notification.
+      this.logger.error('notification webhook refused', { reason: target.error });
+      return;
+    }
 
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10000);
       try {
-        await fetch(settings.webhookUrl, {
+        await fetch(target.url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ ...payload, source: 'deedy-automation' }),
+          body: JSON.stringify({ ...this.scrub(payload), source: 'deedy-automation' }),
           signal: controller.signal,
         });
       } finally {

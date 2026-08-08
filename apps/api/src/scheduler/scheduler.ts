@@ -143,6 +143,22 @@ export interface SchedulerTaskDependencies {
   commandService: CommandTasks;
   credentialService: CredentialTasks;
   notificationService: CredentialNotifier;
+  resumes: TailoredResumeLookup;
+  coverLetters: CoverLetterLookup;
+}
+
+/**
+ * Read-only structural views of the document repositories. The backfill only
+ * ever asks "does this job already have one?", so it takes the two lookups
+ * rather than the repositories — nothing in the scheduler may write a document.
+ */
+export interface TailoredResumeLookup {
+  tailoredFor(jobId: number, parentId: number): { id: number } | undefined;
+  defaultResume(): { id: number } | undefined;
+}
+
+export interface CoverLetterLookup {
+  latestForJob(jobId: number): { id: number } | undefined;
 }
 
 /** Structural views, so the scheduler stays free of concrete service imports. */
@@ -162,6 +178,14 @@ export interface CredentialTasks {
 export interface CredentialNotifier {
   credentialExpired(provider: string): Promise<void>;
 }
+
+/**
+ * How many already-scored jobs the document backfill inspects per tick. Every
+ * one it enqueues is two model calls and a LaTeX compile on this host, so the
+ * backlog is drained a slice at a time rather than dumped into the queue at
+ * once — the ticks keep coming until it is empty.
+ */
+const DOCUMENT_BACKFILL_BATCH = 10;
 
 /** The standard set of recurring jobs that keep the pipeline moving. */
 export function createScheduledTasks(deps: SchedulerTaskDependencies): ScheduledTask[] {
@@ -222,12 +246,98 @@ export function createScheduledTasks(deps: SchedulerTaskDependencies): Scheduled
 
         const candidates = deps.jobs.readyToApply(application.minScoreToApply, 25);
         for (const job of candidates) {
+          // Score says the model liked it; the keyword gate says the user's own
+          // vocabulary recognises it. Both automatic paths ask the same method.
+          if (!deps.applicationService.allowsAutoApply(job)) continue;
           deps.queue.enqueue({
             task: 'application.apply',
             payload: { jobId: job.id },
             dedupeKey: `application.apply:${job.id}`,
             priority: 10,
           });
+        }
+      },
+    },
+    {
+      /**
+       * Backfill for jobs that were scored before `job.score` learned to chain
+       * `resume.tailor` -> `cover_letter.generate`. Those rows are already
+       * `scored`, so nothing else will ever revisit them: without this task the
+       * only way to get their documents is to re-score each one by hand.
+       *
+       * It shares `applyIntervalMinutes` rather than getting a setting of its
+       * own. The cadence it wants is the apply task's — a slow sweep over
+       * already-scored jobs, hours apart, not the minutes-apart scoring loop —
+       * and a backlog that is finite by definition does not justify a new knob
+       * on the Settings page that every user would have to understand.
+       */
+      name: 'documents',
+      intervalMinutes: () => settings().scheduler.applyIntervalMinutes,
+      async run() {
+        const application = settings().application;
+        // Each half is its own toggle AND its own stage switch: the switch is
+        // how the user hands the CPU back, so a stopped stage must not have work
+        // piled behind it while it is off.
+        const wantsResume = application.tailorResume && stageRuns('tailor');
+        const wantsLetter = application.generateCoverLetter && stageRuns('cover_letter');
+        if (!wantsResume && !wantsLetter) return;
+
+        // The same criteria the `job.score` handler applies inline: scored, not
+        // archived, at or above the tailoring threshold. Jobs the model told us
+        // to skip never reach status `scored`, so they are excluded already.
+        const candidates = deps.jobs.search({
+          status: 'scored',
+          minScore: application.minScoreToTailor,
+          archived: false,
+          page: 1,
+          pageSize: DOCUMENT_BACKFILL_BATCH,
+          sort: 'score',
+          order: 'desc',
+        }).items;
+
+        // `tailoredFor` is keyed by the base the tailoring descended from, so the
+        // resolution has to match what `resume.tailor` will itself resolve —
+        // Settings' default id when set, otherwise the default base resume.
+        const baseResumeId = application.defaultResumeId ?? deps.resumes.defaultResume()?.id ?? null;
+
+        for (const job of candidates) {
+          // A tailoring pass is two model calls and a LaTeX compile. The gate's
+          // whole claim is that the user would never apply to this posting, so
+          // the automatic path must ask it here exactly as scoring does.
+          if (!deps.applicationService.allowsAutoApply(job)) continue;
+
+          const tailored =
+            baseResumeId === null ? undefined : deps.resumes.tailoredFor(job.id, baseResumeId);
+
+          if (wantsResume && !tailored) {
+            // Same task, same payload shape and the same dedupe key scoring
+            // uses, so a job that gets re-scored between two ticks lands on the
+            // one queue row instead of tailoring twice.
+            deps.queue.enqueue({
+              task: 'resume.tailor',
+              payload: {
+                jobId: job.id,
+                baseResumeId: application.defaultResumeId,
+                coverLetter: wantsLetter,
+              },
+              dedupeKey: `resume.tailor:${job.id}:${application.defaultResumeId ?? 'default'}`,
+              priority: 8,
+            });
+            // The letter is chained by the tailor handler off the resume it
+            // produces; enqueuing one here too would write it against the base.
+            continue;
+          }
+
+          if (wantsLetter && !deps.coverLetters.latestForJob(job.id)) {
+            deps.queue.enqueue({
+              task: 'cover_letter.generate',
+              // The resume that will actually be uploaded, when there is one —
+              // the same id the tailor handler passes when it chains the letter.
+              payload: { jobId: job.id, resumeId: tailored?.id ?? null },
+              dedupeKey: `cover_letter.generate:${job.id}`,
+              priority: 7,
+            });
+          }
         }
       },
     },

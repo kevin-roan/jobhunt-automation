@@ -68,16 +68,54 @@ WORKDIR /app
 # (apps/api/src/config/env.ts). That default is right for a bare-metal install —
 # the API is unauthenticated — but a container that binds loopback publishes
 # nothing, because here the boundary is Docker's published port.
+# DISPLAY is set unconditionally because docker/entrypoint.sh brings up an Xvfb
+# server on it before exec'ing the app, and BrowserManager.displayAvailable()
+# reads exactly this variable to decide whether attended mode can work. Run with
+# VIRTUAL_DISPLAY=0 to skip the virtual desktop; the entrypoint then unsets
+# DISPLAY so the app correctly reports that no screen exists.
 ENV NODE_ENV=production \
     DATA_DIR=/data \
     WEB_DIR=/app/apps/api/public \
     HOST=0.0.0.0 \
     PORT=8080 \
-    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    VIRTUAL_DISPLAY=1 \
+    DISPLAY=:99 \
+    DISPLAY_NUM=99 \
+    SCREEN_GEOMETRY=1920x1080x24 \
+    VNC_PORT=5900 \
+    NOVNC_PORT=6080
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates fonts-liberation tini curl \
+ && apt-get install -y --no-install-recommends ca-certificates fonts-liberation tini curl bash \
  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Virtual desktop for attended browsing.
+#
+# The point of attended mode is that the user signs in to LinkedIn and Indeed
+# themselves, in a real window, once — no cookies exported, no tokens pasted.
+# That needs a screen, and a container has none, so one is supplied here:
+# Xvfb renders to memory, fluxbox makes the window manageable (focus, resize,
+# modal dialogs), x11vnc exports the display on container-loopback only, and
+# noVNC/websockify serve it over HTTP so the dashboard can embed it directly.
+#
+# x11-utils is only for xdpyinfo, which the entrypoint uses to wait until the X
+# server is actually accepting connections before launching the app.
+# ---------------------------------------------------------------------------
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      xvfb \
+      x11vnc \
+      fluxbox \
+      novnc \
+      websockify \
+      x11-utils \
+      xauth \
+ && rm -rf /var/lib/apt/lists/* \
+ # X servers refuse to start without this directory; it does not exist in a
+ # slim base image because nothing else there uses X.
+ && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
 # ---------------------------------------------------------------------------
 # LaTeX resume rendering.
@@ -143,14 +181,22 @@ RUN npx --yes playwright install --with-deps chromium firefox \
  && chmod -R a+rX /ms-playwright \
  && rm -rf /var/lib/apt/lists/*
 
+# The supervisor that starts the virtual desktop before the app. Copied late so
+# editing it does not invalidate the TeX and Playwright layers above.
+COPY docker/entrypoint.sh /usr/local/bin/deedy-entrypoint.sh
+RUN chmod 755 /usr/local/bin/deedy-entrypoint.sh
+
 RUN mkdir -p /data && chown -R node:node /data /app
 USER node
 
 VOLUME ["/data"]
-EXPOSE 8080
+# 8080 dashboard + API. 6080 noVNC, which grants full control of a browser
+# holding the user's live logins — docker-compose.yml publishes it on 127.0.0.1
+# only, and it should never be exposed beyond this host.
+EXPOSE 8080 6080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=25s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8080/api/health/live || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/deedy-entrypoint.sh"]
 CMD ["node", "apps/api/dist/index.js"]

@@ -232,12 +232,20 @@ Work through these in order. The app is deliberately inert until it has a model 
    experience preferences, and the company slugs per board under `boards`, for example
    `greenhouse: ["stripe", "figma"]`. Board-based collectors stay idle until you list companies for
    them. The same tab has the **Enabled collectors** list.
-5. **Sign in to LinkedIn once.** Browser Sessions → open the `linkedin` profile
-   (`POST /api/browser-sessions/:provider/open`). Turn **headless off** in Settings → **Browser** first
-   so a window actually appears; that means doing this login from a host-mode run (see
-   [Development](#development)) or an image with a display, since the shipped runtime container has
-   no X server. The persistent profile and `storage-state.json` are saved under
-   `DATA_DIR/browser-profiles`, and you never log in again.
+5. **Sign in to LinkedIn once.** Browser Sessions → the **Attended browser** panel. Press **Open
+   browser**, then **Sign in** next to LinkedIn, and complete the login — password and 2FA included —
+   in the browser window itself. Press **Re-check** and it should read *signed in*.
+
+   In Docker that window is drawn on a virtual screen inside the container and streamed into the
+   **Live screen** in that same panel, so you do this without leaving the dashboard; on a bare-metal
+   install it simply opens on your own desktop. Either way the application never sees, types or
+   stores your password — only the resulting session, in the persistent profile under
+   `DATA_DIR/browser-profiles`. Do it once and you never log in again.
+
+   This replaces the old export-your-cookies-and-paste-them flow, which is still available further
+   down the same page for headless installs. See
+   [Attended browsing in the container](docs/deployment.md#attended-browsing-in-the-container) for
+   the moving parts and the security note on port 6080.
 6. **Keep dry run ON until you trust it.** `browser.dryRun` defaults to `true`: the full pipeline
    runs, documents are generated, forms are filled, screenshots are taken - and submit is never
    clicked. Read a few prepared applications end to end. Only then consider Settings →

@@ -12,6 +12,7 @@ makes is to the job boards you configure and to the local LLM endpoint you point
 - [Topology](#topology)
 - [Prerequisites](#prerequisites)
 - [Quick start](#quick-start)
+- [The API token](#the-api-token)
 - [Compose reference](#compose-reference)
 - [Persistent state: the `/data` volume](#persistent-state-the-data-volume)
 - [The encryption key](#the-encryption-key)
@@ -95,9 +96,9 @@ development workflow.
 ### The LaTeX sandbox and `security_opt`
 
 Resumes are LaTeX documents compiled by a real TeX engine. The LaTeX is written by the local model,
-and `POST /api/resumes/compile` takes no authentication, so the input is attacker-influenced. TeX is
-Turing-complete, which means the pattern denylist in front of the engine is a filter and not a
-boundary — it is bypassable by construction.
+so the input is attacker-influenced even though `POST /api/resumes/compile` now requires the API
+token. TeX is Turing-complete, which means the pattern denylist in front of the engine is a filter
+and not a boundary — it is bypassable by construction.
 
 The actual containment is `bubblewrap`: the engine runs in a mount namespace holding only the TeX
 distribution and a throwaway work directory. That is what stops a crafted document reading
@@ -124,6 +125,67 @@ If your policy forbids relaxing seccomp, supply a custom profile permitting `uns
 with the `CLONE_NEW*` flags, or drop the lines and accept that resume compilation is protected by
 the denylist alone. Everything else in the application is unaffected either way.
 
+### Attended browsing in the container
+
+LinkedIn and Indeed both challenge, rate-limit and authwall a scripted login, no matter how the
+credentials are supplied. Attended mode sidesteps that entirely: the app opens **one visible
+browser window**, you sign in to each site by hand exactly as you would in any browser, and the
+persistent profile on disk keeps the session for every collector and application run afterwards.
+Your password is typed into that window; the application never sees, enters or stores it.
+
+That needs a screen, and a container has none — which is why the feature reported "no display
+available" and switched itself off in Docker. The image now supplies one. `docker/entrypoint.sh`
+starts, before the app:
+
+| Process | Role |
+| --- | --- |
+| `Xvfb` on `:99` | An X server rendering to memory. `-nolisten tcp`, so the display is reachable only through its unix socket. |
+| `fluxbox` | A window manager. Without one Chromium's window cannot be focused or resized and modal dialogs stack invisibly — which breaks the manual logins this exists for. |
+| `x11vnc` | Exports `:99` over VNC, bound to **container loopback**. Never published. |
+| `websockify` + noVNC | Serves that screen over HTTP on `6080`, which the dashboard embeds. |
+
+`DISPLAY=:99` is then set for the app, which is exactly what `BrowserManager.displayAvailable()`
+reads, so attended mode reports itself as usable.
+
+**Using it:** open the dashboard → **Browser Sessions**. The *Attended browser* panel has a **Live
+screen** showing the container's desktop. Press **Open browser**, then **Sign in** next to LinkedIn
+or Indeed, complete the login (including any 2FA) directly in the embedded screen, and press
+**Re-check**. That is a one-time step per site.
+
+**Security.** Port 6080 grants full interactive control of a browser holding your live logins.
+Compose therefore publishes it on `127.0.0.1` only. If you move it off loopback, set `VNC_PASSWORD`
+and put it behind the same authenticating reverse proxy as the dashboard — see
+[Networking](#networking-and-reverse-proxies). The VNC transport itself never leaves the container.
+
+Set `VIRTUAL_DISPLAY=0` to skip the whole stack and run purely headless, as before.
+
+### Session source: which login a run uses
+
+Two independent things can hold a signed-in session, so which one a collector or an application run
+actually uses is an explicit setting rather than something inferred: **Settings → Browser → Session
+source** (`browser.sessionStrategy`, seeded by `BROWSER_SESSION_STRATEGY`).
+
+| Value | What a run uses | Needs a screen |
+| --- | --- | --- |
+| `attended` | The shared window you signed in to by hand. **The credential vault is never read** - not even to seed an empty profile - so nothing has to be pasted, and a stale pasted cookie can never overwrite a login you made yourself. | Yes |
+| `stored` | The classic path: a session you exported from your own browser and pasted in, injected as cookies into one profile per provider. | No |
+| `auto` | Follows the **Attended browser** switch. The application default. | - |
+
+Compose pins this to `attended`, because the image ships the screen that makes it work. The
+dashboard shows the resolved answer on the Browser Sessions page ("Used by collectors"), so the
+badge you read and the branch the run takes come from the same function.
+
+Two consequences worth knowing:
+
+- Under `attended`, a source with no pasted credential is **not** a problem. The Sources page stops
+  reporting "No session saved", and `POST /api/credentials/:provider/verify` answers with the
+  attended strategy and points at `POST /api/browser/session/control {"action":"check"}` instead of
+  returning 404 for a vault row that was never meant to exist.
+- Setting `stored` while **Attended browser** is on is legitimate (watch the run, but let the pasted
+  cookie win). In that combination each provider gets its own profile again, so opening the shared
+  attended window is **refused** with an explanation: a window on the shared profile would not be
+  the session collectors drive, and signing in there would change nothing.
+
 ### What the container cannot do
 
 - **VPN exit-location switching.** Settings → VPN drives NetworkManager on the host, so the
@@ -147,8 +209,15 @@ printf 'ENCRYPTION_KEY=%s\n' "$(openssl rand -hex 32)" >> .env
 docker compose up -d --build
 ```
 
-Then open <http://localhost:8080>. The API reference (Scalar, generated from the same Zod schemas
-the routes validate with) is at <http://localhost:8080/docs>.
+Then open <http://localhost:8080>. The dashboard will ask for the API token before it shows you
+anything. Get it from the startup log:
+
+```bash
+docker compose logs app | grep 'API token:'
+```
+
+The API reference (Scalar, generated from the same Zod schemas the routes validate with) is at
+<http://localhost:8080/docs>.
 
 To start the bundled Ollama alongside it:
 
@@ -160,6 +229,98 @@ docker compose exec ollama ollama pull qwen3:8b   # any model you like; none are
 Then in the dashboard go to **Settings -> Local LLM** and set the base URL to `http://ollama:11434` and
 the model to whatever you pulled. See [Connecting the local LLM](#connecting-the-local-llm) for why
 the default `http://localhost:11434` will not work from inside the container.
+
+---
+
+## The API token
+
+Every route under `/api` requires a bearer token. There are no accounts and no passwords: one
+self-hosted instance, one secret.
+
+### Where the token comes from
+
+Resolved at startup, in this order — the same order, and the same file semantics, as
+[the encryption key](#the-encryption-key):
+
+1. **`API_TOKEN` is set** — that value is used verbatim. It must be at least 16 characters;
+   anything shorter throws `API_TOKEN must be at least 16 characters` at startup and the process
+   exits, because a guessable token reads as protection without being any.
+2. **`API_TOKEN` is empty or absent** — the app reads `/data/.api-token`. If that file does not
+   exist, it generates 32 random bytes, writes them there base64url-encoded with mode `0600`, and
+   uses that. The value is then stable across restarts and upgrades; only deleting the file (or
+   the volume) mints a new one.
+
+### Where to find it
+
+Printed at startup, on its own line:
+
+```bash
+docker compose logs app | grep 'API token:'
+# {"level":"info","scope":"app:auth","msg":"API token: kQ8f...  Paste it into the dashboard, ..."}
+```
+
+Or read the file directly, which is authoritative and does not scroll away:
+
+```bash
+docker compose exec app cat /data/.api-token
+```
+
+### How to present it
+
+| Caller | Mechanism |
+| --- | --- |
+| The dashboard | Paste it into the unlock screen once. It is kept in `localStorage` and sent as `Authorization: Bearer`. |
+| `curl`, scripts, the Scalar docs page | `Authorization: Bearer <token>`, or the `X-Api-Token` header |
+| Anything the browser issues itself | `?token=<token>` — `EventSource` (`/api/events`), `<img>` for screenshots and `<a>` for résumé downloads cannot attach a header. The dashboard appends this for you. |
+
+```bash
+curl -fsS -H "Authorization: Bearer $(docker compose exec -T app cat /data/.api-token)" \
+  http://127.0.0.1:8080/api/health
+```
+
+The token is compared in constant time against a SHA-256 digest of what you sent, so a wrong guess
+of any length costs the same and reveals nothing about the real length.
+
+### What is *not* gated
+
+| Path | Why |
+| --- | --- |
+| `GET /api/health/live` | The `Dockerfile` HEALTHCHECK and the compose healthcheck both `curl` exactly this and cannot carry a secret. It returns `{"ok":true}` and nothing else. |
+| `GET /api/auth/status` | Returns one boolean — whether this instance wants a token — so the dashboard knows whether to render its unlock screen. It never returns the token. |
+| `/` and the dashboard's static assets | You have to be able to load the page in order to have somewhere to type the token. The bundle contains no data of yours. |
+| `/docs` | The Scalar reference and the OpenAPI document: schemas only, no data. Requests you fire from it still need the token. |
+
+`GET /api/health` — the dependency report — **is** gated. It names your configured model and
+reports queue depth, which is operational detail about you, not a liveness signal a container
+runtime needs. Point external monitoring at `/api/health/live`, or give it the token.
+
+### Turning authentication off
+
+```bash
+AUTH_ENABLED=false
+```
+
+This is only appropriate when something else in front of the port is doing the authenticating — a
+reverse proxy with basic auth, mTLS or an SSO forward-auth, as in
+[Networking and reverse proxies](#networking-and-reverse-proxies).
+
+> [!CAUTION]
+> **`AUTH_ENABLED=false` together with a widened `APP_BIND` is the dangerous combination.** Either
+> one alone is defensible: auth off behind a loopback binding is the old behaviour, and a widened
+> binding with auth on is a deliberate, protected exposure. Both at once puts your résumé, your
+> name, email and phone, every stored LLM prompt containing them, your application screenshots and
+> your signed-in job-board sessions on the network for anyone who can route to the port. There is
+> no second check behind it.
+
+The token is still generated and still written to `/data/.api-token` when auth is off, so turning
+it back on does not hand you a different secret than the one you already saved.
+
+### The noVNC port is separate
+
+Port 6080 is **not** covered by any of this. It is served by websockify, a different process that
+this API does not control, and it exposes a browser that is signed in to your job-board accounts.
+It stays bound to loopback and unauthenticated unless you set `VNC_PASSWORD` and widen
+`NOVNC_BIND` yourself. Turning API auth on does nothing for it.
 
 ---
 
@@ -176,11 +337,20 @@ the default `http://localhost:11434` will not work from inside the container.
 | `container_name` | `deedy-app` | Stable name for `docker logs deedy-app` and `docker exec`. |
 | `restart` | `unless-stopped` | Survives host reboots and crashes, but stays down if you deliberately `docker compose stop`. |
 | `ports` | `${APP_PORT:-8080}:8080` | Publishes the dashboard/API. Override `APP_PORT` in `.env`. See the binding warning in [Networking](#networking-and-reverse-proxies). |
+| `ports` | `${NOVNC_BIND:-127.0.0.1}:${NOVNC_PORT:-6080}:6080` | noVNC, the attended browser's screen. Loopback-bound deliberately — see [Attended browsing](#attended-browsing-in-the-container). |
+| `environment.VIRTUAL_DISPLAY` | `${VIRTUAL_DISPLAY:-1}` | Starts the Xvfb/x11vnc/noVNC stack in `docker/entrypoint.sh`. `0` runs purely headless. |
+| `environment.SCREEN_GEOMETRY` | `${SCREEN_GEOMETRY:-1920x1080x24}` | Resolution of that virtual screen. |
+| `environment.VNC_PASSWORD` | `${VNC_PASSWORD:-}` | Password for the VNC server. Empty is safe only while the port stays on loopback. |
+| `environment.BROWSER_ATTENDED` | `${BROWSER_ATTENDED:-true}` | Seeds `browser.attended` on first boot only; the dashboard is authoritative afterwards. |
+| `environment.BROWSER_SESSION_STRATEGY` | `${BROWSER_SESSION_STRATEGY:-attended}` | Seeds `browser.sessionStrategy`. See [Session source](#session-source-which-login-a-run-uses). |
+| `environment.REMOTE_VIEW_URL` | `http://localhost:${NOVNC_PORT:-6080}/vnc.html` | What the dashboard embeds. Loaded by *your* browser, so it must be host-reachable. |
 | `environment.NODE_ENV` | `production` | Parsed by the Zod env schema in `apps/api/src/config/env.ts`. |
 | `environment.DATA_DIR` | `/data` | Root of all persisted state; matches the volume mount. |
 | `environment.LOG_LEVEL` | `${LOG_LEVEL:-info}` | One of `trace debug info warn error fatal`. Applies to both stdout and the SQLite `logs` table. |
 | `environment.CORS_ORIGINS` | `${CORS_ORIGINS:-http://localhost:5173}` | Comma-separated allow-list. Irrelevant in single-container production because the dashboard is same-origin. |
 | `environment.ENCRYPTION_KEY` | `${ENCRYPTION_KEY:-}` | 64 hex characters. Empty means "generate and store a key file inside `/data`". |
+| `environment.API_TOKEN` | `${API_TOKEN:-}` | The bearer token every `/api` route requires. Empty means "generate and store `/data/.api-token`". See [The API token](#the-api-token). |
+| `environment.AUTH_ENABLED` | `${AUTH_ENABLED:-true}` | Set `false` **only** behind an authenticating proxy. Never together with a widened `APP_BIND`. |
 | `volumes` | `deedy-data:/data` | The entire application state. See below. |
 | `shm_size` | `1gb` | Chromium crashes with `SIGBUS` / "Target closed" on Docker's default 64 MB `/dev/shm`. |
 | `extra_hosts` | `host.docker.internal:host-gateway` | Lets the container reach an LLM server running directly on the host. |
@@ -206,11 +376,21 @@ APP_PORT=8080
 LOG_LEVEL=info
 CORS_ORIGINS=http://localhost:5173
 ENCRYPTION_KEY=
+API_TOKEN=
+AUTH_ENABLED=true
+APP_BIND=127.0.0.1
 OLLAMA_PORT=11434
+NOVNC_PORT=6080
+NOVNC_BIND=127.0.0.1
+VNC_PASSWORD=
+VIRTUAL_DISPLAY=1
+SCREEN_GEOMETRY=1920x1080x24
+BROWSER_ATTENDED=true
 ```
 
 `.env` is gitignored. Treat it as a secret file: it holds the key that decrypts your stored LLM
-token and notification webhook.
+token and notification webhook, and — if you set it there rather than letting the app generate one
+— the API token as well.
 
 ### Development stack
 
@@ -235,6 +415,7 @@ The image is disposable; the volume is not. `loadConfig()` creates and owns this
 ├── deedy.sqlite-wal        # write-ahead log (journal_mode = WAL)
 ├── deedy.sqlite-shm        # WAL shared-memory index
 ├── .encryption-key         # 32-byte hex key, mode 0600 - only when ENCRYPTION_KEY is unset
+├── .api-token              # bearer token, base64url, mode 0600 - only when API_TOKEN is unset
 ├── artifacts/
 │   ├── screenshots/        # PNGs captured at each automation step
 │   └── html/               # HTML snapshots of pages the applier touched
@@ -374,11 +555,14 @@ application's value comes from careful applications rather than parallel ones.
 ## Networking and reverse proxies
 
 > [!WARNING]
-> **This application has no authentication, no user accounts, and no authorization layer.** Every
-> endpoint under `/api` is open to anyone who can reach the port. It holds your résumés, your
-> personal profile, your logged-in job-board sessions, and it can submit applications on your
-> behalf. **Never expose it to the internet.** Do not port-forward it, do not put it on a public
-> hostname, do not attach it to a Cloudflare tunnel without an access policy in front.
+> **A bearer token is the only thing between this application and whoever can reach the port.**
+> There are no user accounts and no authorization layer — see [The API token](#the-api-token). It
+> holds your résumés, your personal profile, your logged-in job-board sessions, and it can submit
+> applications on your behalf. A single shared secret is the right shape for a single-user app on
+> your own machine; it is not an internet-facing perimeter. **Do not expose it to the internet.**
+> Do not port-forward it, do not put it on a public hostname, do not attach it to a Cloudflare
+> tunnel without an access policy in front. And never combine `AUTH_ENABLED=false` with a widened
+> `APP_BIND`.
 
 Safe deployment patterns, in order of preference:
 
@@ -395,9 +579,17 @@ Safe deployment patterns, in order of preference:
 
 2. **LAN plus a VPN.** Leave the default binding, keep the host off the public internet, and reach
    it through WireGuard/Tailscale when away.
-3. **Reverse proxy on the LAN with authentication in the proxy.** The proxy must add the auth layer
-   the app does not have (basic auth, mTLS, an SSO forward-auth). Fastify is created with
-   `trustProxy: true`, so `X-Forwarded-*` headers from your proxy are honoured.
+3. **Reverse proxy on the LAN with authentication in the proxy.** The app's own bearer token still
+   applies unless you set `AUTH_ENABLED=false`; a proxy that adds basic auth, mTLS or an SSO
+   forward-auth is the only situation in which turning it off is reasonable. Fastify is created
+   with `trustProxy: true`, so `X-Forwarded-*` headers from your proxy are honoured.
+
+   If you keep both layers, mind the header collision: Caddy's `basic_auth` and nginx's
+   `auth_basic` both live in `Authorization`, so the browser's `Authorization: Basic ...` reaches
+   the app instead of its bearer token. Have the proxy inject the app's token itself
+   (`header_up X-Api-Token <token>` in Caddy, `proxy_set_header X-Api-Token <token>` in nginx),
+   which is what the `X-Api-Token` header exists for — or set `AUTH_ENABLED=false` and let the
+   proxy be the only boundary.
 
 A minimal Caddy site that adds basic auth and TLS on a LAN hostname:
 
@@ -718,6 +910,12 @@ scheduled backup is still running.
 | Symptom | Cause and fix |
 | --- | --- |
 | Container exits at once with `ENCRYPTION_KEY must be 32 bytes encoded as 64 hex characters` | The value is not 64 hex chars. Regenerate with `openssl rand -hex 32`. |
+| Container exits at once with `API_TOKEN must be at least 16 characters` | You set `API_TOKEN` to something short. Use a long random value, or unset it and let the app generate one. |
+| Dashboard shows the unlock screen and nothing you paste works | You are reading a token from a different instance or an old volume. `docker compose exec app cat /data/.api-token` is authoritative. |
+| Every API call returns 401 right after a restore or a volume swap | `/data/.api-token` came back with the old volume. Read the new value from the file, or pin `API_TOKEN` in `.env` so it never moves. |
+| Locked out with no way to read the log or the file | Set `API_TOKEN` to a value you choose in `.env` and `docker compose up -d`; it overrides whatever is stored. |
+| Container reports unhealthy forever after a proxy change | Something in front is now intercepting `/api/health/live`. That path is intentionally unauthenticated; the healthcheck curls it from inside the container and must not be redirected. |
+| Live updates and screenshots 401 while the rest of the dashboard works | A proxy is stripping query strings. `EventSource`, `<img>` and download links carry the token as `?token=`. |
 | Log line `dashboard build not found; API only` | The `apps/api/public` build was missing from the image. Rebuild with `docker compose build --no-cache app`. |
 | Browsers crash mid-application, `Target page, context or browser has been closed` | `/dev/shm` too small. Confirm `shm_size: '1gb'` is present and the container was recreated, not just restarted. |
 | `llm.reachable: false` with the bundled Ollama running | `llm.baseUrl` is still `http://localhost:11434`. Set it to `http://ollama:11434`, or `http://host.docker.internal:11434` for a host-side server. |

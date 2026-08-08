@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, statSync } from 'node:fs';
+import { createReadStream, existsSync, realpathSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { z } from 'zod';
 import {
@@ -8,6 +8,7 @@ import {
   compileResumeSchema,
   coverLetterDtoSchema,
   createResumeSchema,
+  queryBooleanSchema,
   resumeDtoSchema,
   resumeTemplateSchema,
   updateResumeSchema,
@@ -29,16 +30,48 @@ const CONTENT_TYPES: Record<string, string> = {
 
 export async function documentRoutes(app: ApiInstance, container: Container): Promise<void> {
   const { resumes, coverLetters, applications } = container.repositories;
-  const dataRoot = path.resolve(container.config.paths.root);
+  /**
+   * Resolved through `realpathSync` because DATA_DIR itself is very often a
+   * symlink — a mounted volume, a moved home directory — and comparing a
+   * link-resolved file against an unresolved root would reject every legitimate
+   * file. Falls back to the lexical path when the directory does not exist yet,
+   * which only happens before first boot has created it.
+   */
+  const dataRoot = ((root: string) => {
+    try {
+      return realpathSync(root);
+    } catch {
+      return root;
+    }
+  })(path.resolve(container.config.paths.root));
 
-  /** Guards against path traversal: only files inside DATA_DIR are servable. */
+  const isInsideDataDir = (candidate: string): boolean =>
+    candidate === dataRoot || candidate.startsWith(dataRoot + path.sep);
+
+  /**
+   * Guards against path traversal: only regular files inside DATA_DIR are
+   * servable.
+   *
+   * The lexical check alone is not enough. Every path that reaches here comes
+   * out of a database row, and the rows are written from paths the browser
+   * pipeline chose — but a symlink planted inside DATA_DIR (by anything else
+   * running as this user, or by an archive extracted into it) would satisfy a
+   * `startsWith` test and still stream `~/.ssh/id_ed25519`. So the link is
+   * followed and the REAL path is what gets tested, and the result must be a
+   * regular file: a directory or a fifo here is either a bug or an attempt.
+   */
   const assertInsideDataDir = (filePath: string): string => {
     const resolved = path.resolve(filePath);
-    if (!resolved.startsWith(dataRoot + path.sep) && resolved !== dataRoot) {
+    if (!isInsideDataDir(resolved)) {
       throw new ValidationError('Refusing to serve a file outside the data directory');
     }
     if (!existsSync(resolved)) throw new NotFoundError('File', path.basename(resolved));
-    return resolved;
+
+    const real = realpathSync(resolved);
+    if (!isInsideDataDir(real) || !statSync(real).isFile()) {
+      throw new ValidationError('Refusing to serve a file outside the data directory');
+    }
+    return real;
   };
 
   app.get(
@@ -47,7 +80,7 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
       schema: {
         tags: ['resumes'],
         summary: 'List resumes, including AI-generated versions',
-        querystring: z.object({ includeGenerated: z.coerce.boolean().default(true) }),
+        querystring: z.object({ includeGenerated: queryBooleanSchema.default(true) }),
         response: { 200: z.object({ resumes: z.array(resumeDtoSchema) }), ...commonErrors },
       },
     },
@@ -107,10 +140,13 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
       if (!previewPath) throw new NotFoundError('Resume preview', request.params.previewId);
 
       const resolved = assertInsideDataDir(previewPath);
-      // Displayed in an `<iframe>` by the editor, so inline rather than attachment.
+      // The editor decodes this itself with pdf.js, but the same URL is also the
+      // "open in a new tab" escape hatch — `inline` keeps a browser that does
+      // have a PDF viewer from downloading it, and the filename is what that
+      // viewer titles the tab with (and what a manual save is named).
       return reply
         .type('application/pdf')
-        .header('content-disposition', 'inline')
+        .header('content-disposition', 'inline; filename="preview.pdf"')
         .send(createReadStream(resolved));
     },
   );
@@ -287,6 +323,27 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
     },
   );
 
+  /**
+   * The resume already tailored for a job, or null when there is none.
+   *
+   * The base is resolved the way `ResumeService.tailorForJob` resolves it —
+   * Settings' default id when set, otherwise the default base resume — because
+   * `tailoredFor` is keyed by the parent the tailoring descended from, and
+   * asking with a different base would miss the row that exists.
+   *
+   * A tailored row that did not compile is deliberately ignored, matching what
+   * `ApplicationService` does with it: that document is never uploaded, so
+   * writing the letter against it would describe a resume nobody receives.
+   */
+  const tailoredResumeIdFor = (jobId: number): number | null => {
+    const settings = container.services.settings.get().application;
+    const baseId = settings.defaultResumeId ?? resumes.defaultResume()?.id ?? null;
+    if (baseId === null) return null;
+
+    const tailored = resumes.tailoredFor(jobId, baseId);
+    return tailored?.compileOk ? tailored.id : null;
+  };
+
   app.get(
     '/cover-letters',
     {
@@ -328,7 +385,12 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
     async (request, reply) => {
       const letter = await container.services.coverLetters.generate({
         jobId: request.body.jobId,
-        resumeId: request.body.resumeId ?? null,
+        // An explicit id always wins; otherwise the resume this job already has.
+        // Without this the service falls back to the default base document, so a
+        // letter generated by hand argued from a resume that is not the one the
+        // application uploads — the automatic path chains the letter off the
+        // tailored resume precisely to avoid that contradiction.
+        resumeId: request.body.resumeId ?? tailoredResumeIdFor(request.body.jobId),
         reuseExisting: !request.body.regenerate,
       });
       return reply.status(201).send(toCoverLetterDto(letter));
@@ -367,10 +429,22 @@ export async function documentRoutes(app: ApiInstance, container: Container): Pr
       const resolved = assertInsideDataDir(row.path);
       const extension = path.extname(resolved).toLowerCase();
       const stats = statSync(resolved);
-      return reply
+      const reader = reply
         .type(CONTENT_TYPES[extension] ?? 'application/octet-stream')
         .header('content-length', String(stats.size))
-        .send(createReadStream(resolved));
+        // The snapshot is a copy of a third-party page. Rendered inline it would
+        // execute in the API's own origin against the API's own cookies, so it
+        // is only ever handed over as a download and never sniffed into a type
+        // the browser would run. (The capture also neutralises inline script
+        // bodies — this is the second half of the same defence.)
+        .header('x-content-type-options', 'nosniff');
+      if (extension === '.html') {
+        reader.header(
+          'content-disposition',
+          `attachment; filename="${path.basename(resolved).replace(/"/g, '')}"`,
+        );
+      }
+      return reader.send(createReadStream(resolved));
     },
   );
 

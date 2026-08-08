@@ -3,8 +3,10 @@ import { chromium, type Browser, type Page } from 'playwright';
 
 import { DEFAULT_SETTINGS, type ProfileSettings } from '@deedy/shared';
 import {
+  classifyConsentText,
   fieldSelector,
   fillField,
+  isFieldEmpty,
   resolveFromProfile,
   scanFields,
   type FieldKind,
@@ -56,6 +58,7 @@ function field(overrides: Partial<FormField> = {}): FormField {
     options: [],
     currentValue: '',
     isConsent: false,
+    isAttestation: false,
     ...overrides,
   };
 }
@@ -260,6 +263,178 @@ describe('resolveFromProfile - checkboxes', () => {
   });
 });
 
+describe('classifyConsentText - acknowledgement versus declaration', () => {
+  const benign = [
+    'I agree to the privacy policy',
+    'I acknowledge the terms and conditions',
+    'I consent to the processing of my personal data under GDPR',
+    'Accept cookies',
+    'Send me marketing updates about new roles',
+    'I have read and agree to the terms of service',
+  ];
+
+  const attestations = [
+    'I certify that the information provided is true and complete',
+    'I attest that I am legally eligible to work in the United States',
+    'I declare under penalty of perjury that the above is correct',
+    'I affirm that my answers are accurate',
+    'Electronic signature',
+    'Type your full name below as your signature',
+    'I agree that all statements in this application are true',
+  ];
+
+  it('treats acknowledgements as auto-tickable consent', () => {
+    for (const text of benign) {
+      expect(classifyConsentText(text.toLowerCase())).toEqual({
+        isConsent: true,
+        isAttestation: false,
+      });
+    }
+  });
+
+  it('treats declarations and signatures as attestations', () => {
+    for (const text of attestations) {
+      expect(classifyConsentText(text.toLowerCase()).isAttestation).toBe(true);
+      expect(classifyConsentText(text.toLowerCase()).isConsent).toBe(false);
+    }
+  });
+
+  it('does not escalate ordinary questions that merely share vocabulary', () => {
+    // "certified"/"certification" belong to skills questions, and "affirmative
+    // action" is an EEO section header — escalating those halts every application.
+    for (const text of [
+      'are you aws certified?',
+      'list your professional certifications',
+      'voluntary self-identification for affirmative action reporting',
+      'confirm your email address',
+      'how did you hear about us?',
+    ]) {
+      expect(classifyConsentText(text).isAttestation).toBe(false);
+    }
+  });
+});
+
+describe('resolveFromProfile - attestations are never auto-answered', () => {
+  it('accepts a privacy-policy tick but refuses a certification', () => {
+    expect(
+      resolveFromProfile(
+        field({
+          kind: 'checkbox',
+          label: 'I agree to the privacy policy',
+          name: 'consent',
+          isConsent: true,
+        }),
+        profile(),
+      ),
+    ).toEqual({ value: 'true', source: 'profile', confidence: 0.95 });
+
+    expect(
+      resolveFromProfile(
+        field({
+          kind: 'checkbox',
+          label: 'I certify that the information provided is true',
+          name: 'certify',
+          isAttestation: true,
+        }),
+        profile(),
+      ),
+    ).toBeNull();
+  });
+
+  it('refuses even when the flag is stale, by re-reading the label', () => {
+    expect(
+      resolveFromProfile(
+        field({
+          kind: 'checkbox',
+          label: 'I declare under penalty of perjury that I am authorized to work',
+          name: 'declaration',
+          isConsent: true,
+        }),
+        profile(),
+      ),
+    ).toBeNull();
+  });
+
+  it('never types the candidate name into a signature field', () => {
+    expect(
+      resolveFromProfile(
+        field({ label: 'Type your name here as your electronic signature', name: 'signature' }),
+        profile(),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('resolveFromProfile - legal declarations', () => {
+  const yesNo = ['Yes', 'No'];
+
+  it('escalates a work-authorization question about another jurisdiction', () => {
+    const authorized = field({
+      kind: 'radio',
+      label: 'Are you legally authorized to work in the United States?',
+      name: 'work_auth',
+      options: yesNo,
+    });
+    expect(resolveFromProfile(authorized, profile({ country: 'India' }))).toBeNull();
+    // The same flag still answers a question about the candidate's own country.
+    expect(resolveFromProfile(authorized, profile({ country: 'United States' }))?.value).toBe('Yes');
+  });
+
+  it('treats an EU member state as covered by an EU-wide question', () => {
+    const authorized = field({
+      kind: 'select',
+      label: 'Are you legally authorized to work in the European Union?',
+      name: 'eu_auth',
+      options: yesNo,
+    });
+    expect(resolveFromProfile(authorized, profile({ country: 'Germany' }))?.value).toBe('Yes');
+  });
+
+  it('says nothing about an unrecognised country rather than inventing a conflict', () => {
+    const sponsorship = field({
+      kind: 'select',
+      label: 'Will you require sponsorship for an employment visa in Freedonia?',
+      name: 'sponsorship',
+      options: yesNo,
+    });
+    expect(resolveFromProfile(sponsorship, profile({ country: 'Ruritania' }))?.value).toBe('No');
+  });
+
+  it('leaves relocation alone — it is a preference, not a legal declaration', () => {
+    const relocate = field({
+      kind: 'radio',
+      label: 'Are you willing to relocate to the United States?',
+      name: 'relocate',
+      options: yesNo,
+    });
+    expect(resolveFromProfile(relocate, profile({ country: 'India' }))?.value).toBe('Yes');
+  });
+
+  it('escalates when the profile states nothing at all', () => {
+    // `authorizedToWork` is a non-nullable boolean today, so an unset flag can
+    // only be simulated. This is the behaviour that arrives for free the day
+    // packages/shared makes it `.nullable().default(null)`.
+    const unset = { ...profile(), authorizedToWork: null as unknown as boolean };
+    const authorized = field({
+      kind: 'radio',
+      label: 'Are you legally authorized to work?',
+      name: 'work_auth',
+      options: yesNo,
+    });
+    expect(resolveFromProfile(authorized, unset)).toBeNull();
+  });
+});
+
+describe('isFieldEmpty', () => {
+  it('reads an unticked checkbox as empty despite the truthy "false" string', () => {
+    expect(isFieldEmpty(field({ kind: 'checkbox', currentValue: 'false' }))).toBe(true);
+    expect(isFieldEmpty(field({ kind: 'checkbox', currentValue: 'true' }))).toBe(false);
+    expect(isFieldEmpty(field({ kind: 'radio', currentValue: 'false' }))).toBe(true);
+    expect(isFieldEmpty(field({ kind: 'text', currentValue: '  ' }))).toBe(true);
+    expect(isFieldEmpty(field({ kind: 'text', currentValue: 'Jane' }))).toBe(false);
+  });
+});
+
 describe('fieldSelector', () => {
   it('targets the index stamped by scanFields', () => {
     expect(fieldSelector(field({ index: 4 }))).toBe('[data-deedy-field="4"]');
@@ -408,6 +583,98 @@ describe('scanFields + fillField against a real page', () => {
         const rescanned = await scanFields(page);
         expect(at(rescanned, 0).currentValue).toBe('Jane');
         expect(at(rescanned, 3).currentValue).toBe('true');
+      } finally {
+        await context.close();
+      }
+    },
+    BROWSER_TIMEOUT_MS,
+  );
+
+  it(
+    'clears stale field attributes so a rescan cannot produce a strict-mode violation',
+    async (ctx) => {
+      const launched = browser;
+      if (!launched) {
+        ctx.skip();
+        return;
+      }
+
+      const context = await launched.newContext();
+      const page: Page = await context.newPage();
+      try {
+        await page.setContent(`<!doctype html>
+          <html><body><form>
+            <label for="a">Alpha</label><input id="a" name="a" />
+            <label for="b">Beta</label><input id="b" name="b" />
+            <label for="c">Gamma</label><input id="c" name="c" />
+          </form></body></html>`);
+
+        const first = await scanFields(page);
+        expect(first.map((entry) => entry.name)).toEqual(['a', 'b', 'c']);
+
+        // Hiding the first field shifts every later index down by one; without a
+        // clear, #b would keep index 1 from this scan while #c is re-stamped 1.
+        await page.evaluate(() => {
+          const alpha = document.getElementById('a');
+          if (alpha) alpha.style.display = 'none';
+        });
+
+        const second = await scanFields(page);
+        expect(second.map((entry) => entry.name)).toEqual(['b', 'c']);
+        expect(await page.locator('[data-deedy-field="0"]').count()).toBe(1);
+        expect(await page.locator('[data-deedy-field="1"]').count()).toBe(1);
+        expect(await page.locator('[data-deedy-field]').count()).toBe(2);
+
+        // The strict-mode violation used to surface here, as a swallowed fill.
+        expect(await fillField(page, at(second, 1), 'gamma')).toBe(true);
+        expect(await page.inputValue('#c')).toBe('gamma');
+      } finally {
+        await context.close();
+      }
+    },
+    BROWSER_TIMEOUT_MS,
+  );
+
+  it(
+    'flags an attestation checkbox but not a privacy acknowledgement',
+    async (ctx) => {
+      const launched = browser;
+      if (!launched) {
+        ctx.skip();
+        return;
+      }
+
+      const context = await launched.newContext();
+      const page: Page = await context.newPage();
+      try {
+        await page.setContent(`<!doctype html>
+          <html><body><form>
+            <label for="privacy"><input id="privacy" name="privacy" type="checkbox" /> I agree to the privacy policy</label>
+            <label for="certify"><input id="certify" name="certify" type="checkbox" /> I certify that the information provided is true and complete</label>
+            <fieldset>
+              <legend>Are you willing to relocate?</legend>
+              <label for="r-yes">Yes</label><input id="r-yes" type="radio" name="relocate" value="yes" />
+              <label for="r-no">No</label><input id="r-no" type="radio" name="relocate" value="no" />
+            </fieldset>
+          </form></body></html>`);
+
+        const fields = await scanFields(page);
+        const privacy = at(fields, 0);
+        const certify = at(fields, 1);
+        const relocate = at(fields, 2);
+
+        expect(privacy.isConsent).toBe(true);
+        expect(privacy.isAttestation).toBe(false);
+        expect(certify.isConsent).toBe(false);
+        expect(certify.isAttestation).toBe(true);
+
+        expect(resolveFromProfile(privacy, profile())?.value).toBe('true');
+        expect(resolveFromProfile(certify, profile())).toBeNull();
+
+        // A radio group answers as a group: picking "No" counts as answered.
+        expect(isFieldEmpty(relocate)).toBe(true);
+        await page.check('#r-no');
+        expect(isFieldEmpty(at(await scanFields(page), 2))).toBe(false);
       } finally {
         await context.close();
       }

@@ -31,9 +31,12 @@ import {
   BROWSER_ENGINES,
   EMPLOYMENT_TYPES,
   EXPERIENCE_LEVELS,
+  KEYWORD_MATCH_MODES,
   LLM_PROVIDERS,
   REMOTE_TYPES,
+  SESSION_STRATEGIES,
   VPN_BACKENDS,
+  resolveSessionStrategy,
   type EmploymentType,
   type ExperienceLevel,
   type RemoteType,
@@ -160,6 +163,20 @@ const VPN_BACKEND_LABELS: Record<Settings['vpn']['backend'], string> = {
   command: 'Custom command',
 };
 
+/** Strategy ids are wire values; these name the thing the user actually picks. */
+const SESSION_STRATEGY_LABELS: Record<Settings['browser']['sessionStrategy'], string> = {
+  auto: 'Automatic (follow Attended browser)',
+  attended: 'Signed-in browser window',
+  stored: 'Pasted session',
+};
+
+/** Mode ids are wire values; these say what is actually compared against your keywords. */
+const KEYWORD_MATCH_LABELS: Record<Settings['application']['keywordMatch'], string> = {
+  off: 'Off (score threshold only)',
+  title: 'Job title only',
+  title_or_skills: 'Job title or extracted skills',
+};
+
 const humanize = (value: string): string => value.replace(/_/g, ' ');
 
 /** Rebuilds a Settings object section by section so every branch stays exactly typed. */
@@ -206,7 +223,20 @@ function buildPatch(section: SectionKey, draft: Settings, server: Settings): Set
     case 'sync': {
       const sync: NonNullable<SettingsPatch['sync']> = { ...draft.sync };
       if (draft.sync.secretKey === server.sync.secretKey) delete sync.secretKey;
+      if (draft.sync.url === server.sync.url) delete sync.url;
+      if (draft.sync.publishableKey === server.sync.publishableKey) delete sync.publishableKey;
+      if (draft.sync.userId === server.sync.userId) delete sync.userId;
       return { sync };
+    }
+    case 'vpn': {
+      const vpn: NonNullable<SettingsPatch['vpn']> = { ...draft.vpn };
+      // These carry credentials on the command line, so they come back masked.
+      if (draft.vpn.connectCommand === server.vpn.connectCommand) delete vpn.connectCommand;
+      if (draft.vpn.disconnectCommand === server.vpn.disconnectCommand) {
+        delete vpn.disconnectCommand;
+      }
+      if (draft.vpn.statusCommand === server.vpn.statusCommand) delete vpn.statusCommand;
+      return { vpn };
     }
     case 'browser':
       return { browser: draft.browser };
@@ -220,8 +250,6 @@ function buildPatch(section: SectionKey, draft: Settings, server: Settings): Set
       return { scheduler: draft.scheduler };
     case 'pipeline':
       return { pipeline: draft.pipeline };
-    case 'vpn':
-      return { vpn: draft.vpn };
     case 'profile':
       return { profile: draft.profile };
   }
@@ -544,7 +572,7 @@ export default function SettingsPage(): JSX.Element {
                 value={draft.llm.baseUrl}
                 onChange={(value) => setLlm({ baseUrl: value })}
                 placeholder="http://localhost:11434"
-                help="Must resolve to a host you control. Nothing is sent anywhere else."
+                help="localhost, a private-network address, a *.local or *.internal name, or a bare service name like ollama. Anything else is refused unless you allow it below."
               />
 
               <TextField
@@ -565,6 +593,25 @@ export default function SettingsPage(): JSX.Element {
                 step={0.05}
                 help="Lower is more deterministic. 0.2 works well for scoring."
               />
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <SwitchField
+                label="Allow a remote LLM endpoint"
+                tone="warning"
+                checked={draft.llm.allowRemoteEndpoint}
+                onChange={(value) => setLlm({ allowRemoteEndpoint: value })}
+                help="Off, the base URL must be on this machine or your private network and anything else is refused before a request is made. Leave it off unless you have a specific reason."
+              />
+              {draft.llm.allowRemoteEndpoint ? (
+                <p className="rounded-md border border-warning/40 bg-warning/5 p-3 text-[11px] leading-relaxed text-warning">
+                  Every prompt leaving this machine carries your name, email, phone number, your
+                  full resume text and the job description — for every job scored, every resume
+                  tailored and every cover letter written. Whoever runs that endpoint sees all of
+                  it, and the API key above is sent to them as a bearer token. Turn this back off
+                  when you are done.
+                </p>
+              ) : null}
             </div>
 
             <Separator className="my-5" />
@@ -748,12 +795,81 @@ export default function SettingsPage(): JSX.Element {
               />
             </div>
 
+            <Separator className="my-5" />
+
+            <div className="space-y-1.5">
+              <Label htmlFor="browser-session-strategy">Session source</Label>
+              <Select
+                id="browser-session-strategy"
+                value={draft.browser.sessionStrategy}
+                onChange={(event) =>
+                  setBrowser({
+                    sessionStrategy: event.target
+                      .value as Settings['browser']['sessionStrategy'],
+                  })
+                }
+              >
+                {SESSION_STRATEGIES.map((value) => (
+                  <option key={value} value={value}>
+                    {SESSION_STRATEGY_LABELS[value]}
+                  </option>
+                ))}
+              </Select>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                Which signed-in state collectors and applications actually use.{' '}
+                <span className="font-medium text-foreground">Signed-in browser window</span> reuses
+                the window you logged into yourself: the credential vault is never read, so there is
+                nothing to paste and a stale pasted cookie can never overwrite a login you made by
+                hand. It needs a screen - your desktop, or the virtual one in the Docker image.{' '}
+                <span className="font-medium text-foreground">Pasted session</span> injects the
+                cookies stored in the vault instead, which works headlessly with no screen at all,
+                at the cost of re-pasting whenever they expire.{' '}
+                <span className="font-medium text-foreground">Automatic</span> follows the Attended
+                browser switch below: on means the window, off means the vault.
+              </p>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                With the current draft, runs would use the{' '}
+                <span className="font-medium text-foreground">
+                  {resolveSessionStrategy(draft.browser) === 'attended'
+                    ? 'signed-in browser window'
+                    : 'pasted session'}
+                </span>
+                . Save to apply it.
+              </p>
+            </div>
+
             <div className="mt-4 space-y-3">
+              <SwitchField
+                label="Attended browser"
+                checked={draft.browser.attended}
+                onChange={(value) => setBrowser({ attended: value })}
+                help={
+                  draft.browser.sessionStrategy === 'stored'
+                    ? 'Opens one visible Chromium window shared by every provider, so you can watch a run or sign in by hand. Session source is set to Pasted session, so collectors still read the vault, not this window. Needs a screen: your own desktop session, or the Docker image, which ships a virtual one and shows it inside the Browser Sessions page.'
+                    : 'One visible Chromium window shared by every provider. Sign in yourself once and, with Session source set to the window or left on Automatic, every collector reuses that session - no cookies to export or paste. Needs a screen: your own desktop session, or the Docker image, which ships a virtual one and shows it inside the Browser Sessions page.'
+                }
+              />
+              <SwitchField
+                label="Shared profile"
+                checked={draft.browser.sharedProfile}
+                onChange={(value) => setBrowser({ sharedProfile: value })}
+                help="Every provider shares one profile directory instead of one each. Implied by attended mode; useful on its own for a headless install that still wants a single cookie jar."
+              />
+              <SwitchField
+                label="Keep the window alive"
+                checked={draft.browser.keepAlive}
+                onChange={(value) => setBrowser({ keepAlive: value })}
+                help="Leaves the attended window open after a run finishes. Off closes it after each run, which loses the point of signing in once."
+              />
               <SwitchField
                 label="Headless"
                 checked={draft.browser.headless}
                 onChange={(value) => setBrowser({ headless: value })}
-                help="Turn off to watch the agent work and to solve logins manually."
+                help={
+                  draft.browser.attended
+                    ? 'Ignored while attended browser is on - the shared window is always visible.'
+                    : 'Turn off to watch the agent work and to solve logins manually. Attended mode overrides this setting.'
+                }
               />
               <SwitchField
                 label="Dry run"
@@ -766,13 +882,14 @@ export default function SettingsPage(): JSX.Element {
                 label="Capture screenshots"
                 checked={draft.browser.captureScreenshots}
                 onChange={(value) => setBrowser({ captureScreenshots: value })}
-                help="Stores a PNG per step so you can audit what happened."
+                tone="warning"
+                help="Stores a PNG per step so you can audit what happened. These are pixels of the filled form, so they contain your name, email, phone and address, plus the signed-in chrome of the job board - and no scrubber can redact an image. They stay in DATA_DIR on this machine and are the most sensitive thing in it."
               />
               <SwitchField
                 label="Capture HTML"
                 checked={draft.browser.captureHtml}
                 onChange={(value) => setBrowser({ captureHtml: value })}
-                help="Stores page HTML for debugging selector failures. Uses more disk."
+                help="Stores page HTML for debugging selector failures. Field values and inline scripts are redacted before the file is written, so the structure survives but your answers do not. Uses more disk."
               />
             </div>
 
@@ -1109,6 +1226,18 @@ export default function SettingsPage(): JSX.Element {
               </div>
             ) : null}
 
+            {/* The score threshold is the obvious gate; the keyword gate is not, so say it here. */}
+            {draft.application.autoApply && draft.application.keywordMatch !== 'off' ? (
+              <p className="mb-4 text-[11px] leading-relaxed text-muted-foreground">
+                Auto-apply is also filtered by your keyword set -{' '}
+                {draft.application.keywordMatch === 'title'
+                  ? 'the job title'
+                  : 'the job title or an extracted skill'}{' '}
+                must match an enabled keyword. See{' '}
+                <span className="font-medium text-foreground">Keyword match</span> below.
+              </p>
+            ) : null}
+
             <div className="space-y-3">
               <SwitchField
                 label="Auto-apply"
@@ -1151,6 +1280,49 @@ export default function SettingsPage(): JSX.Element {
                 onChange={(value) => setApplication({ minScoreToTailor: value })}
                 help="Tailoring is expensive locally, so it is skipped for weak matches."
               />
+            </div>
+
+            <Separator className="my-5" />
+
+            <div className="space-y-1.5">
+              <Label htmlFor="application-keyword-match">Keyword match</Label>
+              <Select
+                id="application-keyword-match"
+                value={draft.application.keywordMatch}
+                onChange={(event) =>
+                  setApplication({
+                    keywordMatch: event.target.value as Settings['application']['keywordMatch'],
+                  })
+                }
+              >
+                {KEYWORD_MATCH_MODES.map((value) => (
+                  <option key={value} value={value}>
+                    {KEYWORD_MATCH_LABELS[value]}
+                  </option>
+                ))}
+              </Select>
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                An extra gate on <strong>automatic</strong> applications only - it never stops you
+                applying by hand.{' '}
+                <span className="font-medium text-foreground">Job title or extracted skills</span>{' '}
+                applies only when the posting&apos;s title, or a skill pulled out of its description,
+                matches one of your enabled keywords.{' '}
+                <span className="font-medium text-foreground">Job title only</span> is stricter: the
+                title alone has to match, so a posting that merely mentions your skills is left
+                alone. <span className="font-medium text-foreground">Off</span> skips the check
+                entirely and applies to anything above the score threshold.
+              </p>
+              {draft.application.keywordMatch === 'off' ? null : (
+                <p className="text-[11px] leading-relaxed text-warning">
+                  With this set to anything but Off and <strong>no enabled keywords</strong>, nothing
+                  matches and the agent will apply to nothing at all - silently. Enable at least one
+                  term on the{' '}
+                  <Link to="/keywords" className="text-primary underline-offset-4 hover:underline">
+                    Keywords
+                  </Link>{' '}
+                  page.
+                </p>
+              )}
             </div>
 
             <Separator className="my-5" />
@@ -1694,13 +1866,21 @@ export default function SettingsPage(): JSX.Element {
                 help="The only setting here that makes an outbound request. Off by default, because everything else in this app stays on your machine."
               />
               {draft.vpn.verifyExitIp ? (
-                <TextField
-                  label="Exit IP endpoint"
-                  value={draft.vpn.exitIpEndpoint}
-                  onChange={(value) => setVpn({ exitIpEndpoint: value })}
-                  placeholder="https://api.protonvpn.ch/vpn/location"
-                  help="Contacted once per connect to read back the address you now appear from. Point it anywhere you trust."
-                />
+                <>
+                  <TextField
+                    label="Exit IP endpoint"
+                    value={draft.vpn.exitIpEndpoint}
+                    onChange={(value) => setVpn({ exitIpEndpoint: value })}
+                    placeholder="Required — an IP-echo URL you trust"
+                    help="Contacted once per connect to read back the address you now appear from. There is no default: whoever you point this at learns your IP and roughly when you connect, so the choice is yours to make."
+                  />
+                  {!draft.vpn.exitIpEndpoint.trim() ? (
+                    <p className="rounded-md border border-border bg-secondary/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
+                      No endpoint set, so verification is skipped. Connecting still works — the exit
+                      address is simply not read back or displayed.
+                    </p>
+                  ) : null}
+                </>
               ) : null}
             </div>
 
@@ -1857,17 +2037,23 @@ export default function SettingsPage(): JSX.Element {
               <NumberField
                 label="Years of experience"
                 value={draft.profile.yearsOfExperience}
-                onChange={(value) => setProfile({ yearsOfExperience: value ?? 0 })}
+                onChange={(value) => setProfile({ yearsOfExperience: value })}
                 min={0}
                 max={60}
                 step={0.5}
+                allowEmpty
+                placeholder="Not set"
+                help="Leave empty rather than guessing. An application asking this gets escalated to you instead of being answered with 0."
               />
               <NumberField
                 label="Notice period (days)"
                 value={draft.profile.noticePeriodDays}
-                onChange={(value) => setProfile({ noticePeriodDays: value ?? 0 })}
+                onChange={(value) => setProfile({ noticePeriodDays: value })}
                 min={0}
                 max={365}
+                allowEmpty
+                placeholder="Not set"
+                help="Empty means unanswered. 0 here means you can start immediately."
               />
               <NumberField
                 label="Desired salary"
@@ -1882,22 +2068,32 @@ export default function SettingsPage(): JSX.Element {
 
             <Separator className="my-5" />
 
+            {/*
+              Three states, not two. The first two of these are legal
+              declarations the agent types into a real application under your
+              name, so "you never said" has to be distinguishable from "you said
+              no" — a switch collapses those and would have the agent declaring
+              work authorisation nobody ever claimed. Left unset, the form filler
+              escalates the question to you instead of answering it.
+            */}
             <div className="grid gap-3 md:grid-cols-2">
-              <SwitchField
+              <TriStateField
                 label="Authorized to work"
-                checked={draft.profile.authorizedToWork}
+                value={draft.profile.authorizedToWork}
                 onChange={(value) => setProfile({ authorizedToWork: value })}
-                help="Answers the standard work-authorization question."
+                help="Answers the standard work-authorization question. Left unset, the agent asks you rather than declaring it."
               />
-              <SwitchField
+              <TriStateField
                 label="Requires sponsorship"
-                checked={draft.profile.requiresSponsorship}
+                value={draft.profile.requiresSponsorship}
                 onChange={(value) => setProfile({ requiresSponsorship: value })}
+                help="A visa declaration. Left unset, the agent asks you."
               />
-              <SwitchField
+              <TriStateField
                 label="Willing to relocate"
-                checked={draft.profile.willingToRelocate}
+                value={draft.profile.willingToRelocate}
                 onChange={(value) => setProfile({ willingToRelocate: value })}
+                help="A preference rather than a declaration, but unset still is not 'no'."
               />
             </div>
 
@@ -2282,6 +2478,56 @@ function NumberField({
         onChange={(event) => handle(event.target.value)}
       />
     </FieldRow>
+  );
+}
+
+/**
+ * A yes/no question that can also be unanswered, laid out like `SwitchField` so
+ * it sits naturally beside them.
+ *
+ * A `Switch` cannot express "not stated", and for a work-authorisation or
+ * sponsorship question that distinction is the whole point: unset means the form
+ * filler escalates to the user instead of declaring something on their behalf.
+ */
+function TriStateField({
+  label,
+  value,
+  onChange,
+  help,
+}: {
+  label: string;
+  value: boolean | null;
+  onChange: (value: boolean | null) => void;
+  help?: string;
+}): JSX.Element {
+  const current = value === null ? 'unset' : value ? 'yes' : 'no';
+  return (
+    <div
+      className={cn(
+        'flex items-start justify-between gap-4 rounded-md border p-3',
+        value === null ? 'border-warning/50 bg-warning/5' : 'border-border',
+      )}
+    >
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{label}</p>
+        {help ? (
+          <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{help}</p>
+        ) : null}
+      </div>
+      <Select
+        className="w-32 shrink-0"
+        value={current}
+        aria-label={label}
+        onChange={(event) => {
+          const next = event.target.value;
+          onChange(next === 'unset' ? null : next === 'yes');
+        }}
+      >
+        <option value="unset">Not stated</option>
+        <option value="yes">Yes</option>
+        <option value="no">No</option>
+      </Select>
+    </div>
   );
 }
 

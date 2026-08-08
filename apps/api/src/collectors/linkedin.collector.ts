@@ -1,4 +1,5 @@
 import type { Page } from 'playwright';
+import { resolveSessionStrategy, type Settings } from '@deedy/shared';
 import { canonicalUrl, sleep, stripHtml } from '../core/utils.js';
 import type { NormalizedJob } from '../repositories/job.repository.js';
 import {
@@ -96,11 +97,53 @@ export function isChallengePage(url: string, body: string): boolean {
   return url.includes('/checkpoint/') || CHALLENGE_BODY_PATTERN.test(body);
 }
 
-const SESSION_FIX_HINT =
-  'linkedin session is not authenticated. Fix: open Browser Sessions, paste a fresh LinkedIn session and include the `li_at` cookie, then re-run the collector.';
+/**
+ * The repair advice is only useful if it names the repair the user can actually
+ * perform, and the two strategies could not be further apart.
+ *
+ * Attended: a visible window for this machine is already open, so a signed-out
+ * LinkedIn is seconds of work — the user presses Sign in, logs in by hand once,
+ * and every later run reuses that profile. Stored: there is no window to sign
+ * into, so the same signed-out result costs a whole export-cookies-from-another
+ * -browser-and-paste-them cycle. That gap is precisely why attended mode exists,
+ * and it is why a hint must never advertise the strategy the run is not using.
+ *
+ * The branch is the RESOLVED strategy, not the raw `attended` switch: someone
+ * who pinned `stored` while keeping the window open for debugging is fixing a
+ * pasted cookie, and telling them to sign in to the window would repair nothing.
+ */
+const ATTENDED_SIGN_IN =
+  'open the Browser page and press Sign in for LinkedIn — a window is already open on this machine; log in there once and this collector will reuse the session';
 
-const CHALLENGE_FIX_HINT =
-  'linkedin is serving a challenge/checkpoint page. Fix: open Browser Sessions, complete the challenge in a real browser and paste a fresh `li_at` cookie.';
+function isAttended(settings: Settings): boolean {
+  return resolveSessionStrategy(settings.browser) === 'attended';
+}
+
+export function sessionFixHint(settings: Settings): string {
+  return isAttended(settings)
+    ? `linkedin session is not authenticated. Fix: ${ATTENDED_SIGN_IN}.`
+    : 'linkedin session is not authenticated. Fix: open Browser Sessions, paste a fresh LinkedIn session and include the `li_at` cookie, then re-run the collector.';
+}
+
+export function challengeFixHint(settings: Settings): string {
+  return isAttended(settings)
+    ? `linkedin is serving a challenge/checkpoint page. Fix: ${ATTENDED_SIGN_IN} — complete the challenge in that window and re-run the collector.`
+    : 'linkedin is serving a challenge/checkpoint page. Fix: open Browser Sessions, complete the challenge in a real browser and paste a fresh `li_at` cookie.';
+}
+
+/** The search page's own challenge wording — same repair, different symptom. */
+export function searchChallengeFixHint(settings: Settings): string {
+  return isAttended(settings)
+    ? `linkedin search returned a challenge/checkpoint page instead of results. Fix: ${ATTENDED_SIGN_IN} — complete the challenge in that window and re-run the collector.`
+    : 'linkedin search returned a challenge/checkpoint page instead of results. Fix: complete the challenge in a real browser and paste a fresh `li_at` cookie under Browser Sessions.';
+}
+
+/** Zero listings everywhere: almost always the session, so advise per strategy too. */
+export function noListingsFixHint(settings: Settings): string {
+  return isAttended(settings)
+    ? `linkedin search returned zero listings for every keyword and location. This usually means the session expired or LinkedIn is serving a challenge page. Fix: ${ATTENDED_SIGN_IN}.`
+    : 'linkedin search returned zero listings for every keyword and location. This usually means the session expired or LinkedIn is serving a challenge page. Fix: paste a fresh LinkedIn session (the `li_at` cookie) under Browser Sessions.';
+}
 
 const DAY_MS = 86400000;
 
@@ -431,6 +474,10 @@ export const linkedinCollector: CollectorDefinition = {
       ? context.settings.search.locations
       : [''];
     const results: NormalizedJob[] = [];
+    // Resolved once: the mode cannot change mid-run, and every warning below
+    // must give the same, mode-correct instruction.
+    const sessionHint = sessionFixHint(context.settings);
+    const challengeHint = challengeFixHint(context.settings);
     const page = await context.browser.newPage(PROVIDER);
 
     /**
@@ -475,11 +522,11 @@ export const linkedinCollector: CollectorDefinition = {
       await page.goto('https://www.linkedin.com/jobs/', { waitUntil: 'domcontentloaded' });
       let landingBody = await readBodyText(page);
       if (isSignedOutUrl(page.url()) || isSignedOutBody(landingBody)) {
-        context.logger.warn(SESSION_FIX_HINT, { url: page.url() });
+        context.logger.warn(sessionHint, { url: page.url() });
         return [];
       }
       if (isChallengePage(page.url(), landingBody)) {
-        context.logger.warn(CHALLENGE_FIX_HINT, { url: page.url() });
+        context.logger.warn(challengeHint, { url: page.url() });
         if (!(await rotateForChallenge('linkedin checkpoint on the jobs landing page'))) return [];
 
         await page.goto('https://www.linkedin.com/jobs/', { waitUntil: 'domcontentloaded' });
@@ -489,7 +536,7 @@ export const linkedinCollector: CollectorDefinition = {
           isSignedOutBody(landingBody) ||
           isChallengePage(page.url(), landingBody)
         ) {
-          context.logger.warn(CHALLENGE_FIX_HINT, { url: page.url(), afterRotation: true });
+          context.logger.warn(challengeHint, { url: page.url(), afterRotation: true });
           return [];
         }
       }
@@ -528,14 +575,15 @@ export const linkedinCollector: CollectorDefinition = {
               if (isSignedOutUrl(url) || isSignedOutBody(body)) {
                 // Deliberately no rotation here: the cookie, not the exit, is
                 // what LinkedIn rejected.
-                context.logger.warn(SESSION_FIX_HINT, { url, keyword, location });
+                context.logger.warn(sessionHint, { url, keyword, location });
                 sawChallenge = true;
                 stop = true;
               } else if (isChallengePage(url, body)) {
-                context.logger.warn(
-                  'linkedin search returned a challenge/checkpoint page instead of results. Fix: complete the challenge in a real browser and paste a fresh `li_at` cookie under Browser Sessions.',
-                  { url, keyword, location },
-                );
+                context.logger.warn(searchChallengeFixHint(context.settings), {
+                  url,
+                  keyword,
+                  location,
+                });
                 if (await rotateForChallenge('linkedin checkpoint on the jobs search page')) {
                   stubs = await loadListingPage(searchUrl);
                 }
@@ -603,13 +651,13 @@ export const linkedinCollector: CollectorDefinition = {
                 // No rotation mid-detail: the results pane and the card cursor
                 // would be lost anyway, so the retry has nothing to resume.
                 if (isChallengePage(page.url(), body)) {
-                  context.logger.warn(CHALLENGE_FIX_HINT, { url: page.url() });
+                  context.logger.warn(challengeHint, { url: page.url() });
                   sawChallenge = true;
                   stop = true;
                   break;
                 }
                 if (isSignedOutUrl(page.url()) || isSignedOutBody(body)) {
-                  context.logger.warn(SESSION_FIX_HINT, { url: page.url() });
+                  context.logger.warn(sessionHint, { url: page.url() });
                   sawChallenge = true;
                   stop = true;
                   break;
@@ -674,10 +722,10 @@ export const linkedinCollector: CollectorDefinition = {
       // Zero stubs everywhere is indistinguishable from a clean "no matches" run
       // in the caller, so surface it here as a likely session problem.
       if (totalStubs === 0 && !sawChallenge) {
-        context.logger.warn(
-          'linkedin search returned zero listings for every keyword and location. This usually means the session expired or LinkedIn is serving a challenge page. Fix: paste a fresh LinkedIn session (the `li_at` cookie) under Browser Sessions.',
-          { keywords: keywords.length, locations: locations.length },
-        );
+        context.logger.warn(noListingsFixHint(context.settings), {
+          keywords: keywords.length,
+          locations: locations.length,
+        });
       }
     } finally {
       await page.close().catch(() => undefined);

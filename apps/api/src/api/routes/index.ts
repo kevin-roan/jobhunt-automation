@@ -14,6 +14,7 @@ import { keywordRoutes } from './keywords.routes.js';
 import { pipelineRoutes } from './pipeline.routes.js';
 import { sourceRoutes } from './sources.routes.js';
 import { vpnRoutes } from './vpn.routes.js';
+import { browserSessionRoutes } from './browser-session.routes.js';
 
 export async function registerRoutes(app: ApiInstance, container: Container): Promise<void> {
   await healthRoutes(app, container);
@@ -30,4 +31,5 @@ export async function registerRoutes(app: ApiInstance, container: Container): Pr
   await pipelineRoutes(app, container);
   await sourceRoutes(app, container);
   await vpnRoutes(app, container);
+  await browserSessionRoutes(app, container);
 }

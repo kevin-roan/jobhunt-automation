@@ -17,7 +17,11 @@ import type { CoverLetterRepository, ResumeRepository } from '../repositories/re
 import type { ResumeRow } from '../db/schema.js';
 import type { DocumentService } from './document.service.js';
 import type { LatexService } from './latex/latex.service.js';
-import { findUnsafeConstruct, latexToPlainText } from './latex/latex.utils.js';
+import {
+  findPreservationBreach,
+  findUnsafeConstruct,
+  latexToPlainText,
+} from './latex/latex.utils.js';
 import type { LlmService } from './llm/llm.service.js';
 import { LlmAbortError } from './llm/providers.js';
 import type { SettingsService } from './settings.service.js';
@@ -178,14 +182,22 @@ export class ResumeService {
     const description = truncate(job.description ?? job.summary ?? '', CONTENT_BUDGET);
 
     let keywords: string[] = [];
+    let missingKeywords: string[] = [];
     let atsScore: number | null = null;
     try {
       const ats = await this.llm.run('ats_keywords', {
-        variables: { description, resume: truncate(base.latex, CONTENT_BUDGET) },
+        // The prose mirror, not the LaTeX: scoring the macros would count
+        // `\runsubsection` as resume content and miss the words around it.
+        variables: { description, resume: truncate(base.markdown, CONTENT_BUDGET) },
         jobId: job.id,
         signal: input.signal,
       });
-      keywords = [...ats.data.keywords, ...ats.data.missingFromResume];
+      // These two lists are opposites and must never be merged: `keywords` is
+      // what the posting asks for, `missingFromResume` is precisely what this
+      // candidate cannot claim. Handing the second to the tailoring prompt as
+      // material to work in is an instruction to fabricate.
+      keywords = ats.data.keywords;
+      missingKeywords = ats.data.missingFromResume;
       atsScore = ats.data.estimatedAtsScore;
     } catch (error) {
       // A cancellation is not a degraded keyword pass to shrug off; continuing
@@ -208,7 +220,8 @@ export class ResumeService {
         title: job.title,
         company: job.company,
         description,
-        keywords: keywords.join(', '),
+        keywords: keywords.join(', ') || '(none extracted)',
+        missingKeywords: missingKeywords.join(', ') || '(none identified)',
         macros: this.latex.macros(),
         resume: truncate(base.latex, CONTENT_BUDGET),
       },
@@ -226,7 +239,24 @@ export class ResumeService {
         construct: unsafe,
       });
     }
-    const latex = unsafe ? base.latex : tailored.data.latex;
+
+    // The second guard, and the one that fires in practice: the user's whole
+    // requirement is that tailoring touches the summary and the skills, never
+    // the work history or the projects. A prompt asks for that; this enforces
+    // it. An altered history is worse than an untailored resume, so it loses.
+    const breach = unsafe ? null : findPreservationBreach(base.latex, tailored.data.latex);
+    if (breach) {
+      this.logger.warn('tailored resume rejected; falling back to the base document', {
+        jobId: job.id,
+        baseResumeId: base.id,
+        reason: breach.reason,
+        missing: breach.missing.length,
+        invented: breach.invented.length,
+      });
+    }
+
+    const rejection = unsafe ? `unsafe LaTeX construct ${unsafe}` : (breach?.reason ?? null);
+    const latex = rejection ? base.latex : tailored.data.latex;
 
     const created = this.resumes.create({
       name: `${base.name} — ${job.company} ${job.title}`.slice(0, 180),
@@ -238,8 +268,12 @@ export class ResumeService {
       isBase: false,
       parentId: base.id,
       jobId: job.id,
-      generatedBy: tailored.model,
-      changeSummary: tailored.data.changeSummary,
+      // A rejected draft was discarded, so the row must not advertise the model
+      // or the changes of a document nobody will ever read.
+      generatedBy: rejection ? 'fallback:base-resume' : tailored.model,
+      changeSummary: rejection
+        ? [`Tailored draft discarded (${rejection}); the base resume is used unchanged.`]
+        : tailored.data.changeSummary,
       atsScore,
     });
 
@@ -248,6 +282,7 @@ export class ResumeService {
       jobId: job.id,
       resumeId: created.id,
       baseResumeId: base.id,
+      rejected: rejection !== null,
     });
 
     return this.resumes.byId(created.id) ?? created;
